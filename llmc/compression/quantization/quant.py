@@ -1365,3 +1365,219 @@ class Weight48IntegerQuantizer(BaseQuantizer):
         weight = self.restore_tensor(weight, org_shape16).to(org_dtype16)
 
         return weight
+
+class HiF8Quantizer(BaseQuantizer):
+    """HiFloat8 quantizer for fake quant simulation."""
+
+    def __init__(self, bit, symmetric, granularity, **kwargs):
+        super().__init__(bit, symmetric, granularity, **kwargs)
+        self.quant_type = 'hif8-quant'
+        self.sym = True
+        self.qmin = None
+        self.qmax = None
+
+    def _hif8_quant_dequant(self, tensor):
+        org_dtype = tensor.dtype
+        x = tensor.float()
+        x_unsigned = torch.abs(x)
+        sign = torch.sign(x)
+
+        eps = 2 ** (-14) if org_dtype == torch.float16 else 2 ** (-45)
+        e = torch.floor(torch.log2(x_unsigned + eps))
+
+        abse = e.abs()
+        mant_bits = torch.zeros_like(abse)
+        mant_bits[abse <= 15] = 1
+        mant_bits[abse <= 7] = 2
+        mant_bits[abse <= 3] = 3
+
+        qdq = (
+            torch.floor(x_unsigned * torch.exp2(-e + mant_bits) + 0.5)
+            * torch.exp2(e - mant_bits)
+            * sign
+        )
+        return qdq.to(org_dtype)
+
+    def fake_quant_act_static(self, act, args={}):
+        q_act = act
+        org_shape = q_act.shape
+        org_dtype = q_act.dtype
+        q_act = self.reshape_tensor(q_act)
+        q_act = self._hif8_quant_dequant(q_act)
+        q_act = self.restore_tensor(q_act, org_shape).to(org_dtype)
+        return q_act
+
+    def fake_quant_act_dynamic(self, act, args={}):
+        q_act = act
+        org_shape = q_act.shape
+        org_dtype = q_act.dtype
+        q_act = self.reshape_tensor(q_act)
+        q_act = self._hif8_quant_dequant(q_act)
+        q_act = self.restore_tensor(q_act, org_shape).to(org_dtype)
+        return q_act
+
+    def fake_quant_weight_static(self, weight, args):
+        if 'dim' in args and 'ic' in args['dim']:
+            q_weight = weight.T
+            need_transpose_back = True
+        else:
+            q_weight = weight
+            need_transpose_back = False
+
+        org_shape = q_weight.shape
+        org_dtype = q_weight.dtype
+        q_weight = self.reshape_tensor(q_weight)
+        q_weight = self._hif8_quant_dequant(q_weight)
+        q_weight = self.restore_tensor(q_weight, org_shape).to(org_dtype)
+
+        if need_transpose_back:
+            q_weight = q_weight.T
+        return q_weight
+
+    def fake_quant_weight_dynamic(self, weight, args={}):
+        return self.fake_quant_weight_static(weight, args)
+
+    @staticmethod
+    def _decode_hif8_code_scalar(code):
+        """Decode one byte using the HiF8 prefix/dot/exponent/mantissa definition."""
+        sign = (code >> 7) & 0x1
+        rem = code & 0x7F  # 7 bits after sign
+
+        if (rem & 0b1100000) == 0b1000000:  # 10 -> D=3
+            d, dot_len = 3, 2
+        elif (rem & 0b1100000) == 0b0100000:  # 01 -> D=2
+            d, dot_len = 2, 2
+        elif (rem & 0b1110000) == 0b0010000:  # 001 -> D=1
+            d, dot_len = 1, 3
+        elif (rem & 0b1111000) == 0b0001000:  # 0001 -> D=0
+            d, dot_len = 0, 4
+        elif (rem & 0b1111000) == 0b0000000:  # 0000 -> DML
+            mant = rem & 0b111
+            if mant == 0:
+                return float('nan') if sign else 0.0
+            val = 2.0 ** (mant - 23)
+            return -val if sign else val
+        else:
+            # Should be unreachable. Keep a safe fallback for robustness.
+            return float('nan')
+
+        mant_width = 3 if d <= 2 else (2 if d == 3 else 1)
+        tail_bits = 7 - dot_len
+        payload = rem & ((1 << tail_bits) - 1)
+        exp_bits = payload >> mant_width if d > 0 else 0
+        mant = payload & ((1 << mant_width) - 1)
+
+        if d == 0:
+            e_dec = 0
+        else:
+            se = (exp_bits >> (d - 1)) & 0x1
+            mag_tail = exp_bits & ((1 << (d - 1)) - 1) if d > 1 else 0
+            mag = (1 << (d - 1)) | mag_tail  # implicit leading 1 in magnitude
+            e_dec = -mag if se else mag
+
+        # Two largest |normal| patterns are reserved for infinities.
+        if abs(e_dec) == 15 and mant == (1 << mant_width) - 1:
+            return float('-inf') if sign else float('inf')
+
+        significand = 1.0 + mant / (2**mant_width)
+        val = significand * (2.0**e_dec)
+        return -val if sign else val
+
+    @classmethod
+    def _build_hif8_tables(cls, device):
+        if not hasattr(cls, '_hif8_decode_table_cpu'):
+            decode_vals = [cls._decode_hif8_code_scalar(c) for c in range(256)]
+            cls._hif8_decode_table_cpu = torch.tensor(decode_vals, dtype=torch.float32)
+
+            pos_pairs = []
+            for code, val in enumerate(decode_vals):
+                if (
+                    val is not None
+                    and not (isinstance(val, float) and (val != val))
+                    and val != float('inf')
+                    and val != float('-inf')
+                    and val >= 0.0
+                ):
+                    pos_pairs.append((float(val), int(code)))
+            pos_pairs.sort(key=lambda x: (x[0], x[1]))
+
+            # Keep one canonical code per positive finite value.
+            uniq_vals = []
+            uniq_codes = []
+            last_val = None
+            for v, c in pos_pairs:
+                if last_val is None or v != last_val:
+                    uniq_vals.append(v)
+                    uniq_codes.append(c)
+                    last_val = v
+            cls._hif8_pos_levels_cpu = torch.tensor(uniq_vals, dtype=torch.float32)
+            cls._hif8_pos_codes_cpu = torch.tensor(uniq_codes, dtype=torch.uint8)
+
+        return (
+            cls._hif8_decode_table_cpu.to(device=device),
+            cls._hif8_pos_levels_cpu.to(device=device),
+            cls._hif8_pos_codes_cpu.to(device=device),
+        )
+
+    @classmethod
+    def _pack_hif8_bits(cls, q_weight):
+        """
+        Pack HiF8-rounded floats to canonical HiF8 byte codes (uint8).
+        """
+        q = q_weight.float()
+        _, pos_levels, pos_codes = cls._build_hif8_tables(q.device)
+
+        flat = q.reshape(-1)
+        abs_flat = flat.abs()
+        sign_mask = flat < 0
+
+        last = pos_levels.numel() - 1
+        idx = torch.bucketize(abs_flat, pos_levels)
+        right = torch.clamp(idx, 0, last)
+        left = torch.clamp(idx - 1, 0, last)
+
+        left_val = pos_levels[left]
+        right_val = pos_levels[right]
+        dl = abs_flat - left_val
+        dr = right_val - abs_flat
+        choose_right = (dr < dl) | ((dr == dl) & (right > left))  # tie -> away from 0
+        picked = torch.where(choose_right, right, left)
+
+        codes = pos_codes[picked]
+        neg_codes = torch.bitwise_or(codes, torch.tensor(0x80, device=q.device, dtype=torch.uint8))
+        codes = torch.where(sign_mask & (codes != 0), neg_codes, codes)
+
+        nan_code = torch.tensor(0x80, device=q.device, dtype=torch.uint8)  # DML + M=0 + sign=1
+        codes = torch.where(torch.isnan(flat), nan_code, codes)
+        return codes.view_as(q_weight)
+
+    @staticmethod
+    def _dummy_hif8_scale(q_weight_code):
+        # Keep tensor interface compatibility with downstream module loaders.
+        if q_weight_code.dim() == 1:
+            return torch.ones((1, 1), dtype=torch.float32, device=q_weight_code.device)
+        return torch.ones((q_weight_code.shape[0], 1), dtype=torch.float32, device=q_weight_code.device)
+
+    def real_quant_weight_static(self, weight, args):
+        q_weight = self.fake_quant_weight_static(weight, args)
+        q_weight = self._pack_hif8_bits(q_weight)
+        scales = self._dummy_hif8_scale(q_weight)
+        zeros = None
+        return q_weight.to(torch.uint8), scales, zeros
+
+    def real_quant_weight_dynamic(self, weight, args={}):
+        q_weight = self.fake_quant_weight_dynamic(weight, args)
+        q_weight = self._pack_hif8_bits(q_weight)
+        scales = self._dummy_hif8_scale(q_weight)
+        zeros = None
+        return q_weight.to(torch.uint8), scales, zeros
+
+    def __repr__(self):
+        return (
+            f'HiF8Quantizer(bit={self.bit},'
+            f'granularity={self.granularity},'
+            f'kwargs={self.kwargs})'
+        )
+
+
+    # flake8: noqa

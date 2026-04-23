@@ -11,6 +11,7 @@ eval:
     download: False
     path: ../assets/wan_t2v/eval/
     bs: 1
+    distributed: False
     target_height: 480
     target_width: 832
     num_frames: 81

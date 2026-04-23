@@ -354,10 +354,12 @@ class Wan2T2V(BaseModel):
         # Wrap both experts with LlmcWanTransformerBlock (same as Wan2.1 per-block layout).
         for block_idx, block in enumerate(self.Pipeline.transformer.blocks):
             new_block = LlmcWanTransformerBlock.new(block)
+            new_block._llmc_transformer_ref = [self.model]
             self.Pipeline.transformer.blocks[block_idx] = new_block
         if hasattr(self.Pipeline, 'transformer_2') and self.Pipeline.transformer_2 is not None:
             for block_idx, block in enumerate(self.Pipeline.transformer_2.blocks):
                 new_block = LlmcWanTransformerBlock.new(block)
+                new_block._llmc_transformer_ref = [self.model]
                 self.Pipeline.transformer_2.blocks[block_idx] = new_block
             self.num_transformer_blocks = len(self.Pipeline.transformer.blocks)
             self.blocks = list(self.Pipeline.transformer.blocks) + list(self.Pipeline.transformer_2.blocks)
@@ -369,6 +371,32 @@ class Wan2T2V(BaseModel):
             self.num_transformer_blocks = len(self.blocks)
             logger.info('Wan2.2: single transformer wrapped (40 blocks).')
         logger.info('Model: %s', self.model)
+
+        # Monkey patch transformer to track timestep progress for HTG evaluation
+        original_forward = self.model.forward
+        self.model._llmc_step_index = 0
+        self.model._llmc_infer_steps = getattr(self, 'sample_steps', None)
+        if self.model._llmc_infer_steps is None:
+            self.model._llmc_infer_steps = 50
+        
+        def patched_forward(*args, **kwargs):
+            if hasattr(self.Pipeline, 'scheduler'):
+                if hasattr(self.Pipeline.scheduler, 'step_index') and self.Pipeline.scheduler.step_index is not None:
+                    self.model._llmc_step_index = self.Pipeline.scheduler.step_index
+                elif hasattr(self.Pipeline.scheduler, '_step_index') and self.Pipeline.scheduler._step_index is not None:
+                    self.model._llmc_step_index = self.Pipeline.scheduler._step_index
+                if hasattr(self.Pipeline, '_num_inference_steps') and self.Pipeline._num_inference_steps is not None:
+                    self.model._llmc_infer_steps = self.Pipeline._num_inference_steps
+            res = original_forward(*args, **kwargs)
+            if not hasattr(self.Pipeline, 'scheduler') or (not hasattr(self.Pipeline.scheduler, 'step_index') and not hasattr(self.Pipeline.scheduler, '_step_index')):
+                if self.model._llmc_step_index is None:
+                    self.model._llmc_step_index = 0
+                self.model._llmc_step_index += 1
+                if self.model._llmc_infer_steps is not None and self.model._llmc_step_index >= self.model._llmc_infer_steps:
+                    self.model._llmc_step_index = 0
+            return res
+            
+        self.model.forward = patched_forward
 
     def find_llmc_model(self):
         self.model = self.Pipeline.transformer

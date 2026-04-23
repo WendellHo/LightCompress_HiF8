@@ -50,6 +50,13 @@ class BaseEval:
         # load data
         if self.eval_dataset_name == 'human_eval':
             testenc = read_problems()
+        elif self.eval_dataset_name in ['t2v', 'i2v']:
+            # Video eval datasets are custom JSON samples from local path.
+            # Keep behavior stable regardless of `download` flag value.
+            assert self.eval_dataset_path, 'Please set path in eval_cfg for t2v/i2v.'
+            testdata = self.get_cutomdata(self.eval_dataset_path)
+            self.testdata = testdata
+            testenc = self.testdata
         else:
             if self.download:
                 if self.eval_dataset_name == 'wikitext2':

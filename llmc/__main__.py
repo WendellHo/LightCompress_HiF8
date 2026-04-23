@@ -173,9 +173,21 @@ def main(config):
                 update_autoawq_quant_config(config, save_quant_path)
 
             elif config.save.get('save_lightx2v', False):
-                deploy_all_modality(blockwise_opts, 'lightx2v_quant')
+                has_hif8_quant = False
+                for modality_config in modality_configs:
+                    weight_quant_type = modality_config.weight.get(
+                        'quant_type', 'int-quant'
+                    )
+                    if weight_quant_type in ['hif8-quant', 'hif8']:
+                        has_hif8_quant = True
+                        break
+
+                deploy_quant_format = (
+                    'lightx2v_hif8_quant' if has_hif8_quant else 'lightx2v_quant'
+                )
+                deploy_all_modality(blockwise_opts, deploy_quant_format)
                 blockwise_opt.save_model(save_quant_path)
-                update_lightx2v_quant_config(save_quant_path)
+                update_lightx2v_quant_config(save_quant_path, config)
 
         if 'opencompass' in config:
             assert config.save.get('save_trans', False)

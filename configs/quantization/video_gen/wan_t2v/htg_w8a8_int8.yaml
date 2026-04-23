@@ -30,24 +30,26 @@ eval:
     target_width: 832
     num_frames: 81
     guidance_scale: 5.0
-    output_video_path: ./output_videos_sq/
+    output_video_path: ./output_videos_htg_int8/
 quant:
     video_gen:
-        method: SmoothQuant
+        method: HTG
         weight:
-            quant_type: float-quant
-            bit: e4m3          # FP8 E4M3 格式
+            quant_type: int-quant
+            bit: 8
             symmetric: True
             granularity: per_channel
-            use_qtorch: True
+            group_size: -1
         act:
-            quant_type: float-quant
-            bit: e4m3          # FP8 E4M3 格式
+            quant_type: int-quant
+            bit: 8
             symmetric: True
             granularity: per_token
-            use_qtorch: True
         special:
-            alpha: 0.75        # SmoothQuant 平衡参数
+            alpha: 0.99
+            group_ratio: 10
+            min_group_num: 1
+            enable_dynamic_runtime: True
 save:
     save_lightx2v: True
-    save_path: /home/hezhiye/hif8_quant/quant_model/wan_smoothquant_int8_x2v-1/
+    save_path: /home/hezhiye/hif8_quant/quant_model/wan_htg_w8a8_int8/

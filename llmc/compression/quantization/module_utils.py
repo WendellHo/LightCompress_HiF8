@@ -85,16 +85,71 @@ class LlmcWanTransformerBlock(nn.Module):
             self.scale_shift_table + temb
         ).chunk(6, dim=1)
 
+        # Get progress from the monkey-patched transformer wrapper
+        progress = 0.0
+        if hasattr(self, '_llmc_transformer_ref'):
+            obj = self._llmc_transformer_ref[0]
+            if hasattr(obj, '_llmc_step_index') and hasattr(obj, '_llmc_infer_steps'):
+                step_idx = obj._llmc_step_index
+                infer_steps = obj._llmc_infer_steps
+                if step_idx is not None and infer_steps is not None and infer_steps > 1:
+                    progress = float(step_idx) / float(infer_steps - 1)
+
+        def get_group_idx(boundaries):
+            if boundaries is None or boundaries.numel() == 0:
+                return 0
+            idx = 0
+            for b in boundaries.flatten():
+                if progress > float(b.item()):
+                    idx += 1
+                else:
+                    break
+            return idx
+
+        # Helper to swap linear biases
+        def swap_linear_biases(module, group_idx):
+            original_biases = {}
+            for name, layer in module.named_modules():
+                if hasattr(layer, 'htg_group_bias'):
+                    has_orig_bias = hasattr(layer, 'bias') and layer.bias is not None
+                    original_biases[layer] = layer.bias if has_orig_bias else None
+                    idx = max(0, min(group_idx, layer.htg_group_bias.shape[0] - 1))
+                    if has_orig_bias and isinstance(layer.bias, nn.Parameter):
+                        layer.bias = nn.Parameter(layer.htg_group_bias[idx], requires_grad=False)
+                    else:
+                        layer.bias = layer.htg_group_bias[idx]
+            return original_biases
+
+        def restore_linear_biases(original_biases):
+            for layer, bias in original_biases.items():
+                if bias is None:
+                    if hasattr(layer, 'bias'):
+                        layer.bias = None
+                else:
+                    layer.bias = bias
+
         # 1. Self-attention
-        norm1_weight = (1 + scale_msa) * self.affine_norm1.weight
-        norm1_bias = shift_msa * self.affine_norm1.bias
+        boundaries1 = getattr(self.affine_norm1, 'htg_group_boundaries', None)
+        group_idx1 = get_group_idx(boundaries1)
+        if hasattr(self.affine_norm1, 'htg_norm_weight'):
+            htg_weight = self.affine_norm1.htg_norm_weight[group_idx1]
+            htg_bias = self.affine_norm1.htg_norm_bias[group_idx1]
+            norm1_weight = (1 + scale_msa) * htg_weight
+            norm1_bias = (shift_msa - 1.0) * htg_weight + htg_bias
+        else:
+            norm1_weight = (1 + scale_msa) * self.affine_norm1.weight
+            norm1_bias = (shift_msa - 1.0) * self.affine_norm1.weight + self.affine_norm1.bias
 
         norm_hidden_states = (
             self.affine_norm1(hidden_states.float()) * norm1_weight + norm1_bias
         ).type_as(hidden_states)
+        
+        orig_biases1 = swap_linear_biases(self.attn1, group_idx1)
         attn_output = self.attn1(
             hidden_states=norm_hidden_states, rotary_emb=rotary_emb
         )
+        restore_linear_biases(orig_biases1)
+        
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
             hidden_states
         )
@@ -108,13 +163,25 @@ class LlmcWanTransformerBlock(nn.Module):
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
-        norm3_weight = (1 + c_scale_msa) * self.affine_norm3.weight
-        norm3_bias = c_shift_msa * self.affine_norm3.bias
+        boundaries3 = getattr(self.affine_norm3, 'htg_group_boundaries', None)
+        group_idx3 = get_group_idx(boundaries3)
+        if hasattr(self.affine_norm3, 'htg_norm_weight'):
+            htg_weight3 = self.affine_norm3.htg_norm_weight[group_idx3]
+            htg_bias3 = self.affine_norm3.htg_norm_bias[group_idx3]
+            norm3_weight = (1 + c_scale_msa) * htg_weight3
+            norm3_bias = (c_shift_msa - 1.0) * htg_weight3 + htg_bias3
+        else:
+            norm3_weight = (1 + c_scale_msa) * self.affine_norm3.weight
+            norm3_bias = (c_shift_msa - 1.0) * self.affine_norm3.weight + self.affine_norm3.bias
 
         norm_hidden_states = (
             self.affine_norm3(hidden_states.float()) * norm3_weight + norm3_bias
         ).type_as(hidden_states)
+        
+        orig_biases3 = swap_linear_biases(self.ffn, group_idx3)
         ff_output = self.ffn(norm_hidden_states)
+        restore_linear_biases(orig_biases3)
+        
         hidden_states = (
             hidden_states.float() + ff_output.float() * c_gate_msa
         ).type_as(hidden_states)
@@ -1007,6 +1074,25 @@ class Lightx2vRealQuantLinear(VllmRealQuantLinear):
         )
 
 
+class Lightx2vHiF8RealQuantLinear(VllmRealQuantLinear):
+    def __init__(self, weight, bias, scales, input_scale, need_pack, scales_name):
+        super().__init__(weight, bias, scales, input_scale, need_pack, scales_name)
+
+    def __repr__(self):
+        return (
+            'Lightx2vHiF8RealQuantLinear('
+            + f'in_features={self.in_features}, '
+            + f'out_features={self.out_features}, '
+            + f'bias={self.bias is not None}, '
+            + f'weight_shape={self.weight_shape}, '
+            + f'weight_dtype={self.weight_dtype}, '
+            + f'scales_shape={self.scales_shape}, '
+            + f'scales_dtype={self.scales_dtype}, '
+            + f'zeros_shape={self.zeros_shape}, '
+            + f'zeros_dtype={self.zeros_dtype})'
+        )
+
+
 class SglRealQuantLinear(VllmRealQuantLinear):
     def __init__(self, weight, bias, scales, input_scale, need_pack, scales_name):
         super().__init__(weight, bias, scales, input_scale, need_pack, scales_name)
@@ -1219,6 +1305,7 @@ _LLMC_LINEAR_TYPES_ = [
     AutoawqRealQuantLinear,
     MlcllmRealQuantLinear,
     LightllmRealQuantLinear,
+    Lightx2vHiF8RealQuantLinear,
 ]
 
 _REALQUANT_LINEAR_MAP_ = {
@@ -1228,4 +1315,5 @@ _REALQUANT_LINEAR_MAP_ = {
     'autoawq_quant': AutoawqRealQuantLinear,
     'mlcllm_quant': MlcllmRealQuantLinear,
     'lightx2v_quant': Lightx2vRealQuantLinear,
+    'lightx2v_hif8_quant': Lightx2vHiF8RealQuantLinear,
 }

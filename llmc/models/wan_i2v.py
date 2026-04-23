@@ -67,7 +67,12 @@ class WanI2V(WanT2V):
         first_block_input = defaultdict(list)
         Catcher = self.get_catcher(first_block_input)
         self.blocks[0] = Catcher(self.blocks[0])
+        handles = []
         self.Pipeline.to('cuda')
+        if self.calib_inference_per_block:
+            handles = self._register_calib_video_hooks()
+            self._move_video_blocks('cpu')
+            logger.info('video_gen calib: enabled inference_per_block for transformer blocks.')
         for data in calib_data:
             self.blocks[0].step = 0
             try:
@@ -83,6 +88,8 @@ class WanI2V(WanT2V):
                 )
             except ValueError:
                 pass
+        for h in handles:
+            h.remove()
 
         self.first_block_input = first_block_input
         assert len(self.first_block_input['data']) > 0, 'Catch input data failed.'

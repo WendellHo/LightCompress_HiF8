@@ -178,6 +178,14 @@ class BaseModel(metaclass=ABCMeta):
                 self.module = module
                 self.signature = inspect.signature(module.forward)
 
+            def __getattr__(self, name):
+                # Preserve attribute access on wrapped blocks (e.g. attention_type)
+                # so model internals that inspect layer attributes keep working.
+                try:
+                    return super().__getattr__(name)
+                except AttributeError:
+                    return getattr(self.module, name)
+
             def forward(self, *args, **kwargs):
                 params = list(self.signature.parameters.keys())
                 for i, arg in enumerate(args):
@@ -416,6 +424,7 @@ class BaseModel(metaclass=ABCMeta):
                 continue
 
             M = module.new(m, **params_dict)
+            self._inherit_htg_runtime_tensors(m, M)
 
             name_tmp = name.rsplit('.', 1)
             if len(name_tmp) == 2:
@@ -440,6 +449,7 @@ class BaseModel(metaclass=ABCMeta):
             if isinstance(m, module):
                 continue
             M = module.new(m, **params_dict)
+            self._inherit_htg_runtime_tensors(m, M)
 
             name_tmp = name.rsplit('.', 1)
             if len(name_tmp) == 2:
@@ -456,6 +466,21 @@ class BaseModel(metaclass=ABCMeta):
         del lns
         gc.collect()
         torch.cuda.empty_cache()
+
+    def _inherit_htg_runtime_tensors(self, src_module, dst_module):
+        """Preserve HTG runtime buffers across module replacement."""
+        for name, buf in src_module.named_buffers(recurse=False):
+            if not name.startswith('htg_') or hasattr(dst_module, name):
+                continue
+            dst_module.register_buffer(name, buf.detach().clone())
+
+        for name, param in src_module.named_parameters(recurse=False):
+            if not name.startswith('htg_') or hasattr(dst_module, name):
+                continue
+            dst_module.register_parameter(
+                name,
+                nn.Parameter(param.detach().clone(), requires_grad=False),
+            )
 
     def convert_dtype(self, dtype='torch.float16'):
         for i in range(len(self.blocks)):

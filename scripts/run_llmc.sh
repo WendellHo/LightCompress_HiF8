@@ -2,7 +2,7 @@
 
 # export CUDA_VISIBLE_DEVICES=0,1
 
-llmc=/path/to/llmc
+llmc=/home/hezhiye/hif8_quant/pre_experiments/LightCompress_HiF8
 export PYTHONPATH=$llmc:$PYTHONPATH
 
 task_name=awq_w_only

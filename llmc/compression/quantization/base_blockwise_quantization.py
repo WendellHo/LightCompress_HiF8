@@ -37,6 +37,7 @@ from .module_utils import (_LLMC_LINEAR_TYPES_, _LLMC_LN_TYPES_,
                            RotateLinear)
 from .quant import (
     FloatQuantizer,
+    HiF8Quantizer,
     IntegerQuantizer,
     Weight48IntegerQuantizer,
 )
@@ -138,6 +139,12 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         if self.model.torch_dtype == torch.float8_e4m3fn:
             self.fp8_block_size = self.model.fp8_block_size
 
+        calib_cfg = self.config.get('calib', {})
+        self.stream_stats = bool(calib_cfg.get('stream_stats', False))
+        self.stream_chunk_size = int(calib_cfg.get('stream_chunk_size', 0) or 0)
+        if self.stream_chunk_size < 0:
+            self.stream_chunk_size = 0
+
         if 'ignored_layers' in self.config:
             self.mixed_precision = True
             self.ignored_block_ids = self.config.ignored_layers.get('block_ids', [])
@@ -161,6 +168,10 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
                 self.weight_quant_module = IntegerQuantizer
         elif quant_type == 'float-quant':
             self.weight_quant_module = FloatQuantizer
+        elif quant_type in ['hif8-quant', 'hif8']:
+            self.weight_quant_module = HiF8Quantizer
+        else:
+            raise ValueError(f'Unsupported weight quant_type: {quant_type}')
         logger.info(f'The used Weight Quant Module is {self.weight_quant_module}')
         self.wquantizer = self.weight_quant_module(**self.quant_config['weight'])
 
@@ -179,6 +190,10 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
                     self.act_quant_module = IntegerQuantizer
             elif quant_type == 'float-quant':
                 self.act_quant_module = FloatQuantizer
+            elif quant_type in ['hif8-quant', 'hif8']:
+                self.act_quant_module = HiF8Quantizer
+            else:
+                raise ValueError(f'Unsupported act quant_type: {quant_type}')
             self.act_static = self.quant_config['act'].get('static', False)
             if self.act_static:
                 assert (
@@ -381,24 +396,47 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         if input_data is None:
             input_data = self.input['data']
 
+        block_device = next(block.parameters()).device
         for i in range(len(input_data)):
-            input_data[i] = input_data[i].to(device=next(block.parameters()).device)
-            for k in self.input['kwargs'][i]:
-                if torch.is_tensor(self.input['kwargs'][i][k]):
-                    self.input['kwargs'][i][k] = self.input['kwargs'][i][k].to(
-                        device=next(block.parameters()).device
-                    )
-                if isinstance(self.input['kwargs'][i][k], tuple):
-                    self.input['kwargs'][i][k] = tuple(
-                        tmp.to(device=next(block.parameters()).device)
-                        for tmp in self.input['kwargs'][i][k]
-                    )
+            if self.stream_stats:
+                current_input = input_data[i].to(device=block_device)
+                current_kwargs = self._to_device_non_mutating(
+                    self.input['kwargs'][i], block_device
+                )
+            else:
+                input_data[i] = input_data[i].to(device=block_device)
+                for k in self.input['kwargs'][i]:
+                    if torch.is_tensor(self.input['kwargs'][i][k]):
+                        self.input['kwargs'][i][k] = self.input['kwargs'][i][k].to(
+                            device=block_device
+                        )
+                    if isinstance(self.input['kwargs'][i][k], tuple):
+                        self.input['kwargs'][i][k] = tuple(
+                            tmp.to(device=block_device)
+                            for tmp in self.input['kwargs'][i][k]
+                        )
+                current_input = input_data[i]
+                current_kwargs = self.input['kwargs'][i]
             with torch.no_grad():
-                out = block(input_data[i], **self.input['kwargs'][i])
+                out = block(current_input, **current_kwargs)
                 if isinstance(out, tuple):
                     out = out[0]
-                output.append(out)
+                if self.stream_stats:
+                    output.append(out.detach().cpu())
+                else:
+                    output.append(out)
         return output
+
+    def _to_device_non_mutating(self, obj, device):
+        if torch.is_tensor(obj):
+            return obj.to(device=device)
+        if isinstance(obj, dict):
+            return {k: self._to_device_non_mutating(v, device) for k, v in obj.items()}
+        if isinstance(obj, tuple):
+            return tuple(self._to_device_non_mutating(v, device) for v in obj)
+        if isinstance(obj, list):
+            return [self._to_device_non_mutating(v, device) for v in obj]
+        return obj
 
     def block_opt(self, block):
 
@@ -406,6 +444,7 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             self.register_kv_cache(block)
 
         block = block.cuda()
+        self._current_block = block
         named_linears = self.model.get_block_linears(block)
         extra_modules = self.model.get_extra_modules(block)
 
@@ -425,6 +464,7 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         self.block_init(block)
 
         self.run(block, input_feat, handles)
+        self._current_block = None
 
         block = block.cpu()
         del input_feat, block

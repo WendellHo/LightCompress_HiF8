@@ -4,13 +4,14 @@ from .base_blockwise_quantization import BaseBlockwiseQuantization
 from .dgq import DGQ
 from .gptq import GPTQ
 from .hqq import HQQ
+from .htg import HTG
 from .kvquant import KiviQuantKVCache, NaiveQuantKVCache
 from .llmint8 import LlmInt8
 from .module_utils import FakeQuantLinear
 from .ntweak import NormTweaking
 from .omniq import OmniQuant
 from .osplus import OsPlus
-from .quant import FloatQuantizer, IntegerQuantizer
+from .quant import FloatQuantizer, HiF8Quantizer, IntegerQuantizer
 from .quarot import Quarot
 from .quik import QUIK
 from .rtn import RTN

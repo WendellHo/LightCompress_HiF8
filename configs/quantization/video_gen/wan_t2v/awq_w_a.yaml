@@ -10,6 +10,7 @@ calib:
     path: ../assets/wan_t2v/calib/
     sample_steps: 20
     bs: 1
+    distributed_merge: False
     target_height: 480
     target_width: 832
     num_frames: 81
@@ -22,6 +23,7 @@ eval:
     download: False
     path: ../assets/wan_t2v/calib/
     bs: 1
+    distributed: False
     target_height: 480
     target_width: 832
     num_frames: 81

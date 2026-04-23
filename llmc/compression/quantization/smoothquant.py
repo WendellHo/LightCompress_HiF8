@@ -41,8 +41,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
         scale_max = None
         for x in tensors:
             x = x.cuda()
-            x = x.abs().view(-1, x.shape[-1])
-            comming_max = torch.max(x, dim=0)[0].float()
+            comming_max = self._channel_abs_max(x)
             if scale_max is not None:
                 scale_max = torch.max(scale_max, comming_max)
             else:
@@ -51,12 +50,58 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return scale_max
 
     @torch.no_grad()
+    def _channel_abs_max(self, x):
+        x = x.view(-1, x.shape[-1])
+        if not self.stream_stats or self.stream_chunk_size <= 0 or x.shape[0] <= self.stream_chunk_size:
+            return x.abs().max(dim=0)[0]
+
+        max_values = None
+        for start in range(0, x.shape[0], self.stream_chunk_size):
+            end = min(start + self.stream_chunk_size, x.shape[0])
+            current = x[start:end].abs().max(dim=0)[0]
+            max_values = current if max_values is None else torch.maximum(max_values, current)
+        return max_values
+
+    @torch.no_grad()
+    def _get_stream_act_scale(self, stream_stats):
+        scale_max = stream_stats.get('act_abs_max', None)
+        if scale_max is None:
+            raise ValueError('stream_stats enabled but act_abs_max is empty.')
+        return scale_max
+
+    @torch.no_grad()
     def search_scale_subset(self, layers, tensors):
         w_max = self.get_weight_scale(layers)
-        x_max = self.get_act_scale(tensors)
+        if self.stream_stats and isinstance(tensors, dict):
+            x_max = self._get_stream_act_scale(tensors)
+        else:
+            x_max = self.get_act_scale(tensors)
         x_max = x_max.to(dtype=w_max.dtype, device=w_max.device)
         scale = (x_max.pow(self.alpha) / w_max.pow(1 - self.alpha)).clamp(min=1e-5)
         return scale
+
+    @torch.no_grad()
+    def cache_input_hook(self, m, x, y, name, feat_dict):
+        if not self.stream_stats:
+            return super().cache_input_hook(m, x, y, name, feat_dict)
+
+        inputs = [i.detach() for i in x]
+        if len(inputs) != 1 or not torch.is_tensor(inputs[0]):
+            return super().cache_input_hook(m, x, y, name, feat_dict)
+
+        inp = inputs[0]
+        if len(inp.shape) == 2:
+            inp = inp.unsqueeze(0)
+        inp = inp.abs().view(-1, inp.shape[-1]).amax(dim=0).to(torch.float32).cpu()
+
+        if not isinstance(feat_dict[name], dict):
+            feat_dict[name] = {}
+        if 'act_abs_max' in feat_dict[name]:
+            feat_dict[name]['act_abs_max'] = torch.maximum(
+                feat_dict[name]['act_abs_max'], inp
+            )
+        else:
+            feat_dict[name]['act_abs_max'] = inp
 
     @torch.no_grad()
     def subset_transform(
