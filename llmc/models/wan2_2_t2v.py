@@ -376,16 +376,25 @@ class Wan2T2V(BaseModel):
         original_forward = self.model.forward
         self.model._llmc_step_index = 0
         self.model._llmc_infer_steps = getattr(self, 'sample_steps', None)
+        self.model._llmc_forward_call_count = 0
         if self.model._llmc_infer_steps is None:
             self.model._llmc_infer_steps = 50
         
         def patched_forward(*args, **kwargs):
+            self.model._llmc_forward_call_count += 1
             if hasattr(self.Pipeline, 'scheduler'):
                 if hasattr(self.Pipeline.scheduler, 'step_index') and self.Pipeline.scheduler.step_index is not None:
                     self.model._llmc_step_index = self.Pipeline.scheduler.step_index
                 elif hasattr(self.Pipeline.scheduler, '_step_index') and self.Pipeline.scheduler._step_index is not None:
                     self.model._llmc_step_index = self.Pipeline.scheduler._step_index
-                if hasattr(self.Pipeline, '_num_inference_steps') and self.Pipeline._num_inference_steps is not None:
+                if (
+                    hasattr(self.Pipeline.scheduler, 'timesteps')
+                    and self.Pipeline.scheduler.timesteps is not None
+                ):
+                    runtime_infer_steps = len(self.Pipeline.scheduler.timesteps)
+                    if runtime_infer_steps > 0:
+                        self.model._llmc_infer_steps = runtime_infer_steps
+                elif hasattr(self.Pipeline, '_num_inference_steps') and self.Pipeline._num_inference_steps is not None:
                     self.model._llmc_infer_steps = self.Pipeline._num_inference_steps
             res = original_forward(*args, **kwargs)
             if not hasattr(self.Pipeline, 'scheduler') or (not hasattr(self.Pipeline.scheduler, 'step_index') and not hasattr(self.Pipeline.scheduler, '_step_index')):

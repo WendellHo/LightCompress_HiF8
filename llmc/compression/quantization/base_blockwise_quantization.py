@@ -74,7 +74,26 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
     def w_q(self, module, wquantizer):
         return wquantizer.real_quant_weight_dynamic(module.weight.data)
 
+    def _get_hiband_fake_quant_scale(self, act, module, aquantizer):
+        quant_type = str(getattr(aquantizer, 'quant_type', '')).lower()
+        if quant_type not in ['hif8-quant', 'hif8']:
+            return None
+
+        hiband_scale = getattr(module, 'hiband_act_scale', None)
+        if not torch.is_tensor(hiband_scale):
+            return None
+        if act.dim() == 0 or hiband_scale.numel() != act.shape[-1]:
+            return None
+
+        view_shape = [1] * act.dim()
+        view_shape[-1] = hiband_scale.numel()
+        return hiband_scale.to(device=act.device, dtype=act.dtype).view(*view_shape)
+
     def a_qdq(self, act, module, aquantizer, input_index=0):
+        hiband_scale = self._get_hiband_fake_quant_scale(act, module, aquantizer)
+        if hiband_scale is not None:
+            act = act / hiband_scale
+
         if self.act_static:
             args = {
                 'scales': (getattr(module, f'buf_act_scales_{input_index}', None)),
@@ -82,9 +101,13 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
                 'qmax': (getattr(module, f'buf_act_qmax_{input_index}', None)),
                 'qmin': (getattr(module, f'buf_act_qmin_{input_index}', None)),
             }
-            return aquantizer.fake_quant_act_static(act, args)
+            act = aquantizer.fake_quant_act_static(act, args)
         else:
-            return aquantizer.fake_quant_act_dynamic(act)
+            act = aquantizer.fake_quant_act_dynamic(act)
+
+        if hiband_scale is not None:
+            act = act * hiband_scale
+        return act
 
     def get_replacement_params(self, mode='fake_quant', w_only=False, name=None):
         params_dict = {}
@@ -390,7 +413,7 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             m.register_buffer('buf_qmax', torch.tensor(max_int).to(self.dev))
             m.register_buffer('buf_qmin', torch.tensor(min_int).to(self.dev))
 
-    def block_forward(self, block, input_data=None):
+    def block_forward(self, block, input_data=None, collect_output=True):
         output = []
 
         if input_data is None:
@@ -421,10 +444,11 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
                 out = block(current_input, **current_kwargs)
                 if isinstance(out, tuple):
                     out = out[0]
-                if self.stream_stats:
-                    output.append(out.detach().cpu())
-                else:
-                    output.append(out)
+                if collect_output:
+                    if self.stream_stats:
+                        output.append(out.detach().cpu())
+                    else:
+                        output.append(out)
         return output
 
     def _to_device_non_mutating(self, obj, device):

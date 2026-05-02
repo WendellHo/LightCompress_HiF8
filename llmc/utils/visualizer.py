@@ -16,6 +16,57 @@ except Exception:
     )
 
 
+def visualize_hiband_channel_histogram(
+    hist_counts,
+    min_exp,
+    save_path,
+    block_idx,
+    channel_idx,
+    side,
+    offset=None,
+    best_k=None,
+    topk_values=None,
+):
+    if 'plt' not in globals():
+        logger.warning('Skip HiBand histogram visualization because matplotlib is unavailable.')
+        return
+
+    counts = np.asarray(hist_counts, dtype=np.float64)
+    hist_len = counts.shape[0]
+    if offset is not None:
+        channel_offset = int(offset)
+        exponents = np.arange(
+            int(min_exp) + channel_offset,
+            int(min_exp) + channel_offset + hist_len,
+            dtype=np.int32,
+        )
+    else:
+        exponents = np.arange(int(min_exp), int(min_exp) + hist_len, dtype=np.int32)
+
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.bar(exponents, counts, width=0.9, color='#4C72B0', edgecolor='black', linewidth=0.4)
+    ax.set_xlabel('Initial Exponent')
+    ax.set_ylabel('Parameter Count')
+
+    title_parts = [f'Block {block_idx}', side, f'Channel {channel_idx}']
+    if offset is not None:
+        title_parts.append(f'offset={int(offset)}')
+    if best_k is not None:
+        title_parts.append(f'best_k={int(best_k)}')
+    if topk_values:
+        topk_str = ','.join(str(int(value)) for value in topk_values)
+        title_parts.append(f'topk={topk_str}')
+    ax.set_title(' | '.join(title_parts))
+
+    if counts.shape[0] <= 64:
+        ax.set_xticks(exponents)
+    ax.grid(axis='y', linestyle='--', alpha=0.35)
+    fig.tight_layout()
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    fig.savefig(save_path, bbox_inches='tight', dpi=150)
+    plt.close(fig)
+
+
 def to_pil_image(
     image_tensor,
     mean=[0.48145466, 0.4578275, 0.40821073],

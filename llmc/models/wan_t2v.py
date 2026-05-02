@@ -57,21 +57,32 @@ class WanT2V(BaseModel):
         original_forward = self.model.forward
         self.model._llmc_step_index = 0
         self.model._llmc_infer_steps = getattr(self, 'sample_steps', None)
+        self.model._llmc_forward_call_count = 0
         if self.model._llmc_infer_steps is None:
             self.model._llmc_infer_steps = 50
 
         
         def patched_forward(*args, **kwargs):
+            self.model._llmc_forward_call_count += 1
             # Hack to get the current progress from scheduler if available
             if hasattr(self.Pipeline, 'scheduler'):
                 if hasattr(self.Pipeline.scheduler, 'step_index') and self.Pipeline.scheduler.step_index is not None:
                     self.model._llmc_step_index = self.Pipeline.scheduler.step_index
                 elif hasattr(self.Pipeline.scheduler, '_step_index') and self.Pipeline.scheduler._step_index is not None:
                     self.model._llmc_step_index = self.Pipeline.scheduler._step_index
-                
-                # Try to get infer_steps, it's usually set in pipeline during __call__
-                # But pipeline sets `num_inference_steps` locally.
-                if hasattr(self.Pipeline, '_num_inference_steps') and self.Pipeline._num_inference_steps is not None:
+
+                # Diffusers WanPipeline keeps `num_inference_steps` local, but the
+                # scheduler timesteps have already been materialized when the
+                # transformer forward runs. Prefer the real runtime length here so
+                # HTG group progress matches actual eval sampling steps.
+                if (
+                    hasattr(self.Pipeline.scheduler, 'timesteps')
+                    and self.Pipeline.scheduler.timesteps is not None
+                ):
+                    runtime_infer_steps = len(self.Pipeline.scheduler.timesteps)
+                    if runtime_infer_steps > 0:
+                        self.model._llmc_infer_steps = runtime_infer_steps
+                elif hasattr(self.Pipeline, '_num_inference_steps') and self.Pipeline._num_inference_steps is not None:
                     self.model._llmc_infer_steps = self.Pipeline._num_inference_steps
             
             res = original_forward(*args, **kwargs)
@@ -322,6 +333,17 @@ class WanT2V(BaseModel):
             },
             {
                 'layers': {
+                    'attn1.to_out.0': block.attn1.to_out[0],
+                },
+                'prev_op': [block.attn1],
+                'input': ['attn1.to_out.0'],
+                'inspect': block.attn1,
+                'has_kwargs': True,
+                'sub_keys': {'rotary_emb': 'rotary_emb'},
+                'is_attn_o': True,
+            },
+            {
+                'layers': {
                     'attn2.to_q': block.attn2.to_q,
                 },
                 'prev_op': [block.norm2],
@@ -329,6 +351,17 @@ class WanT2V(BaseModel):
                 'inspect': block.attn2,
                 'has_kwargs': True,
                 'sub_keys': {'encoder_hidden_states': 'encoder_hidden_states'},
+            },
+            {
+                'layers': {
+                    'attn2.to_out.0': block.attn2.to_out[0],
+                },
+                'prev_op': [block.attn2],
+                'input': ['attn2.to_out.0'],
+                'inspect': block.attn2,
+                'has_kwargs': True,
+                'sub_keys': {'encoder_hidden_states': 'encoder_hidden_states'},
+                'is_attn_o': True,
             },
             {
                 'layers': {

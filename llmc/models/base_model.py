@@ -468,19 +468,36 @@ class BaseModel(metaclass=ABCMeta):
         torch.cuda.empty_cache()
 
     def _inherit_htg_runtime_tensors(self, src_module, dst_module):
-        """Preserve HTG runtime buffers across module replacement."""
+        """Preserve HTG/HiBand runtime tensors across module replacement."""
+        runtime_prefixes = ('htg_', 'hiband_')
+
         for name, buf in src_module.named_buffers(recurse=False):
-            if not name.startswith('htg_') or hasattr(dst_module, name):
+            if not any(name.startswith(prefix) for prefix in runtime_prefixes):
                 continue
-            dst_module.register_buffer(name, buf.detach().clone())
+
+            cloned = None if buf is None else buf.detach().clone()
+            if name in dst_module._buffers:
+                dst_module._buffers[name] = cloned
+                object.__setattr__(dst_module, name, cloned)
+            elif not hasattr(dst_module, name):
+                dst_module.register_buffer(name, cloned)
+            else:
+                setattr(dst_module, name, cloned)
 
         for name, param in src_module.named_parameters(recurse=False):
-            if not name.startswith('htg_') or hasattr(dst_module, name):
+            if not any(name.startswith(prefix) for prefix in runtime_prefixes):
                 continue
-            dst_module.register_parameter(
-                name,
-                nn.Parameter(param.detach().clone(), requires_grad=False),
+
+            cloned = None if param is None else nn.Parameter(
+                param.detach().clone(), requires_grad=False
             )
+            if name in dst_module._parameters:
+                dst_module._parameters[name] = cloned
+                object.__setattr__(dst_module, name, cloned)
+            elif not hasattr(dst_module, name):
+                dst_module.register_parameter(name, cloned)
+            else:
+                setattr(dst_module, name, cloned)
 
     def convert_dtype(self, dtype='torch.float16'):
         for i in range(len(self.blocks)):

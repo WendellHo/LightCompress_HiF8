@@ -1,4 +1,6 @@
+import inspect
 import math
+import os
 from functools import partial
 
 import numpy as np
@@ -60,6 +62,41 @@ class FakeAffineLayerNorm(nn.Module):
         return f'affine=True (emulated), shape={self.weight.shape}'
 
 
+def _patch_attn_o_forward(linear_layer, progress):
+    has_htg_input = hasattr(linear_layer, 'htg_input_shift') and hasattr(
+        linear_layer, 'htg_input_scale'
+    )
+    if not has_htg_input:
+        return None
+    original_forward = linear_layer.forward
+
+    boundaries = getattr(linear_layer, 'htg_group_boundaries', None)
+    if boundaries is not None and boundaries.numel() > 0:
+        group_idx = 0
+        for b in boundaries.flatten():
+            if progress > float(b.item()):
+                group_idx += 1
+            else:
+                break
+    else:
+        group_idx = 0
+
+    def patched_forward(x):
+        idx = max(0, min(group_idx, linear_layer.htg_input_shift.shape[0] - 1))
+        shift = linear_layer.htg_input_shift[idx].to(x.device, x.dtype)
+        scale = linear_layer.htg_input_scale.to(x.device, x.dtype)
+        x = (x - shift) / scale
+        return original_forward(x)
+
+    linear_layer.forward = patched_forward
+    return original_forward
+
+
+def _unpatch_attn_o_forward(linear_layer, original_forward):
+    if original_forward is not None:
+        linear_layer.forward = original_forward
+
+
 class LlmcWanTransformerBlock(nn.Module):
     def __init__(self, module):
         super().__init__()
@@ -113,7 +150,12 @@ class LlmcWanTransformerBlock(nn.Module):
                 if hasattr(layer, 'htg_group_bias'):
                     has_orig_bias = hasattr(layer, 'bias') and layer.bias is not None
                     original_biases[layer] = layer.bias if has_orig_bias else None
-                    idx = max(0, min(group_idx, layer.htg_group_bias.shape[0] - 1))
+                    layer_boundaries = getattr(layer, 'htg_group_boundaries', None)
+                    if layer_boundaries is not None and layer_boundaries.numel() > 0:
+                        layer_group_idx = get_group_idx(layer_boundaries)
+                    else:
+                        layer_group_idx = group_idx
+                    idx = max(0, min(layer_group_idx, layer.htg_group_bias.shape[0] - 1))
                     if has_orig_bias and isinstance(layer.bias, nn.Parameter):
                         layer.bias = nn.Parameter(layer.htg_group_bias[idx], requires_grad=False)
                     else:
@@ -127,6 +169,36 @@ class LlmcWanTransformerBlock(nn.Module):
                         layer.bias = None
                 else:
                     layer.bias = bias
+
+        def swap_linear_hiband_scales(module, group_idx):
+            original_scales = {}
+            for _, layer in module.named_modules():
+                if not hasattr(layer, 'hiband_group_act_scales'):
+                    continue
+                group_scales = getattr(layer, 'hiband_group_act_scales', None)
+                if group_scales is None or not torch.is_tensor(group_scales):
+                    continue
+                if group_scales.dim() == 1:
+                    selected = group_scales
+                elif group_scales.shape[0] > 0:
+                    idx = max(0, min(group_idx, group_scales.shape[0] - 1))
+                    selected = group_scales[idx]
+                else:
+                    continue
+                had_attr = hasattr(layer, 'hiband_act_scale')
+                original_scales[layer] = (
+                    had_attr,
+                    getattr(layer, 'hiband_act_scale', None),
+                )
+                layer.hiband_act_scale = selected
+            return original_scales
+
+        def restore_linear_hiband_scales(original_scales):
+            for layer, (had_attr, scale) in original_scales.items():
+                if had_attr:
+                    layer.hiband_act_scale = scale
+                elif hasattr(layer, 'hiband_act_scale'):
+                    delattr(layer, 'hiband_act_scale')
 
         # 1. Self-attention
         boundaries1 = getattr(self.affine_norm1, 'htg_group_boundaries', None)
@@ -145,26 +217,72 @@ class LlmcWanTransformerBlock(nn.Module):
         ).type_as(hidden_states)
         
         orig_biases1 = swap_linear_biases(self.attn1, group_idx1)
+        orig_hiband1 = swap_linear_hiband_scales(self.attn1, group_idx1)
+        orig_attn1_o_fwd = _patch_attn_o_forward(self.attn1.to_out[0], progress)
         attn_output = self.attn1(
             hidden_states=norm_hidden_states, rotary_emb=rotary_emb
         )
+        _unpatch_attn_o_forward(self.attn1.to_out[0], orig_attn1_o_fwd)
         restore_linear_biases(orig_biases1)
+        restore_linear_hiband_scales(orig_hiband1)
         
         hidden_states = (hidden_states.float() + attn_output * gate_msa).type_as(
             hidden_states
         )
 
         # 2. Cross-attention
-        norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
-        attn_output = self.attn2(
-            hidden_states=norm_hidden_states,
-            encoder_hidden_states=encoder_hidden_states,
-        )
+        boundaries2 = getattr(self.norm2, 'htg_group_boundaries', None)
+        group_idx2 = get_group_idx(boundaries2)
+        if hasattr(self.norm2, 'htg_norm_weight'):
+            norm2_weight = self.norm2.htg_norm_weight[group_idx2]
+            norm2_bias = self.norm2.htg_norm_bias[group_idx2]
+            norm_hidden_states = F.layer_norm(
+                hidden_states.float(),
+                self.norm2.normalized_shape,
+                weight=norm2_weight,
+                bias=norm2_bias,
+                eps=self.norm2.eps,
+            ).type_as(hidden_states)
+        else:
+            norm_hidden_states = self.norm2(hidden_states.float()).type_as(hidden_states)
+        orig_biases2 = swap_linear_biases(self.attn2, group_idx2)
+        orig_hiband2 = swap_linear_hiband_scales(self.attn2, group_idx2)
+        orig_attn2_o_fwd = _patch_attn_o_forward(self.attn2.to_out[0], progress)
+        try:
+            attn_output = self.attn2(
+                hidden_states=norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+            )
+        finally:
+            _unpatch_attn_o_forward(self.attn2.to_out[0], orig_attn2_o_fwd)
+            restore_linear_biases(orig_biases2)
+            restore_linear_hiband_scales(orig_hiband2)
         hidden_states = hidden_states + attn_output
 
         # 3. Feed-forward
         boundaries3 = getattr(self.affine_norm3, 'htg_group_boundaries', None)
         group_idx3 = get_group_idx(boundaries3)
+        if (
+            os.getenv('LLMC_HTG_DEBUG', '0') == '1'
+            and getattr(self, 'block_idx', None) == 0
+            and hasattr(self, '_llmc_transformer_ref')
+        ):
+            transformer = self._llmc_transformer_ref[0]
+            logger.info(
+                'HTG_DEBUG block={} forward_call={} step_index={} infer_steps={} '
+                'progress={:.6f} group_idx=[{},{},{}] boundaries_size=[{},{},{}]',
+                getattr(self, 'block_idx', -1),
+                getattr(transformer, '_llmc_forward_call_count', -1),
+                getattr(transformer, '_llmc_step_index', None),
+                getattr(transformer, '_llmc_infer_steps', None),
+                progress,
+                group_idx1,
+                group_idx2,
+                group_idx3,
+                0 if boundaries1 is None else boundaries1.numel(),
+                0 if boundaries2 is None else boundaries2.numel(),
+                0 if boundaries3 is None else boundaries3.numel(),
+            )
         if hasattr(self.affine_norm3, 'htg_norm_weight'):
             htg_weight3 = self.affine_norm3.htg_norm_weight[group_idx3]
             htg_bias3 = self.affine_norm3.htg_norm_bias[group_idx3]
@@ -179,8 +297,10 @@ class LlmcWanTransformerBlock(nn.Module):
         ).type_as(hidden_states)
         
         orig_biases3 = swap_linear_biases(self.ffn, group_idx3)
+        orig_hiband3 = swap_linear_hiband_scales(self.ffn, group_idx3)
         ff_output = self.ffn(norm_hidden_states)
         restore_linear_biases(orig_biases3)
+        restore_linear_hiband_scales(orig_hiband3)
         
         hidden_states = (
             hidden_states.float() + ff_output.float() * c_gate_msa
@@ -920,7 +1040,17 @@ class EffcientFakeQuantLinear(nn.Module):
 
 
 class VllmRealQuantLinear(nn.Module):
-    def __init__(self, weight, bias, scales, input_scale, need_pack, scales_name):
+    def __init__(
+        self,
+        weight,
+        bias,
+        scales,
+        input_scale,
+        need_pack,
+        scales_name,
+        hiband_act_scale=None,
+        hiband_group_act_scales=None,
+    ):
         super().__init__()
         weight_name = 'weight_packed' if need_pack else 'weight'
         self.register_buffer(weight_name, weight)
@@ -933,6 +1063,8 @@ class VllmRealQuantLinear(nn.Module):
 
         self.register_buffer(scales_name, scales)
         self.register_buffer('input_scale', input_scale)
+        self.register_buffer('hiband_act_scale', hiband_act_scale)
+        self.register_buffer('hiband_group_act_scales', hiband_group_act_scales)
 
     @torch.no_grad()
     def forward(self, x):
@@ -946,6 +1078,8 @@ class VllmRealQuantLinear(nn.Module):
             input_scale = module.buf_act_scales_0
         else:
             input_scale = None
+        hiband_act_scale = getattr(module, 'hiband_act_scale', None)
+        hiband_group_act_scales = getattr(module, 'hiband_group_act_scales', None)
         if (
             'act' in quant_config
             and quant_config.act.get('static', False)
@@ -965,7 +1099,22 @@ class VllmRealQuantLinear(nn.Module):
         else:
             scales_name = 'weight_scale'
 
-        new_module = cls(weight, bias, scales, input_scale, need_pack, scales_name)
+        init_params = inspect.signature(cls.__init__).parameters
+        hiband_kwargs = {}
+        if 'hiband_act_scale' in init_params:
+            hiband_kwargs['hiband_act_scale'] = hiband_act_scale
+        if 'hiband_group_act_scales' in init_params:
+            hiband_kwargs['hiband_group_act_scales'] = hiband_group_act_scales
+
+        new_module = cls(
+            weight,
+            bias,
+            scales,
+            input_scale,
+            need_pack,
+            scales_name,
+            **hiband_kwargs,
+        )
         new_module.in_features = module.in_features
         new_module.out_features = module.out_features
         new_module.weight_shape = weight.shape
@@ -1075,8 +1224,27 @@ class Lightx2vRealQuantLinear(VllmRealQuantLinear):
 
 
 class Lightx2vHiF8RealQuantLinear(VllmRealQuantLinear):
-    def __init__(self, weight, bias, scales, input_scale, need_pack, scales_name):
-        super().__init__(weight, bias, scales, input_scale, need_pack, scales_name)
+    def __init__(
+        self,
+        weight,
+        bias,
+        scales,
+        input_scale,
+        need_pack,
+        scales_name,
+        hiband_act_scale=None,
+        hiband_group_act_scales=None,
+    ):
+        super().__init__(
+            weight,
+            bias,
+            scales,
+            input_scale,
+            need_pack,
+            scales_name,
+            hiband_act_scale=hiband_act_scale,
+            hiband_group_act_scales=hiband_group_act_scales,
+        )
 
     def __repr__(self):
         return (
@@ -1094,8 +1262,27 @@ class Lightx2vHiF8RealQuantLinear(VllmRealQuantLinear):
 
 
 class SglRealQuantLinear(VllmRealQuantLinear):
-    def __init__(self, weight, bias, scales, input_scale, need_pack, scales_name):
-        super().__init__(weight, bias, scales, input_scale, need_pack, scales_name)
+    def __init__(
+        self,
+        weight,
+        bias,
+        scales,
+        input_scale,
+        need_pack,
+        scales_name,
+        hiband_act_scale=None,
+        hiband_group_act_scales=None,
+    ):
+        super().__init__(
+            weight,
+            bias,
+            scales,
+            input_scale,
+            need_pack,
+            scales_name,
+            hiband_act_scale=hiband_act_scale,
+            hiband_group_act_scales=hiband_group_act_scales,
+        )
 
     def __repr__(self):
         return (

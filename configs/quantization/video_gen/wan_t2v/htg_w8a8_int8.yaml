@@ -10,7 +10,7 @@ calib:
     path: ../assets/wan_t2v/calib/
     stream_stats: False
     stream_chunk_size: 1
-    sample_steps: 20
+    sample_steps: 100
     bs: 1
     distributed_merge: False
     target_height: 480
