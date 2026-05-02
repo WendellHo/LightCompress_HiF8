@@ -1,11 +1,152 @@
 import gc
 import os
 import sys
+from functools import lru_cache
 
 import torch
 from loguru import logger
 
 from .utils import ceil_div
+
+HIF8_MIN_NORMAL_EXP = -15
+HIF8_MAX_NORMAL_EXP = 15
+HIF8_MIN_DML_EXP = -22
+HIF8_ZERO_TO_MIN_DML_TIE = 2.0 ** (-23)
+HIF8_MAX_FINITE = 2.0 ** 15
+HIF8_INF_TIE_RATIO = 1.25
+HIF8_MAX_FINITE_TO_INF_TIE = HIF8_MAX_FINITE * HIF8_INF_TIE_RATIO
+HIF8_HIBAND_BUCKET_SAMPLES = 4096
+
+
+def _is_hif8_inf_payload(e_dec, mant, mant_width):
+    # Per HiFloat8 spec, only the largest positive-magnitude normal payload
+    # encodes infinity. The mirrored negative-exponent payload stays finite.
+    return e_dec == HIF8_MAX_NORMAL_EXP and mant == ((1 << mant_width) - 1)
+
+
+def hif8_qdq_ta(tensor):
+    """Quant-dequant to HiF8 using the spec's TA rounding for forward/inference."""
+    org_dtype = tensor.dtype
+    x = tensor.float()
+    abs_x = x.abs()
+    sign = torch.sign(x)
+
+    out = torch.zeros_like(x)
+    nan_mask = torch.isnan(x)
+    pos_inf_mask = torch.isposinf(x)
+    neg_inf_mask = torch.isneginf(x)
+    finite_mask = ~(nan_mask | pos_inf_mask | neg_inf_mask)
+
+    out[nan_mask] = torch.nan
+    out[pos_inf_mask] = torch.inf
+    out[neg_inf_mask] = -torch.inf
+
+    if bool(finite_mask.any().item()):
+        finite_abs = abs_x[finite_mask]
+        finite_sign = sign[finite_mask]
+
+        overflow_mask = finite_abs >= HIF8_MAX_FINITE_TO_INF_TIE
+        underflow_mask = finite_abs < HIF8_ZERO_TO_MIN_DML_TIE
+        quant_mask = ~(overflow_mask | underflow_mask)
+
+        finite_out = torch.zeros_like(finite_abs)
+        finite_out[overflow_mask] = finite_sign[overflow_mask] * torch.inf
+
+        if bool(quant_mask.any().item()):
+            quant_abs = finite_abs[quant_mask]
+            quant_sign = finite_sign[quant_mask]
+            e = torch.floor(torch.log2(quant_abs))
+            e = torch.where(
+                e <= (HIF8_MIN_DML_EXP - 1),
+                torch.full_like(e, HIF8_MIN_DML_EXP),
+                e,
+            )
+            abs_e = e.abs()
+            mant_bits = torch.zeros_like(abs_e)
+            mant_bits[abs_e <= HIF8_MAX_NORMAL_EXP] = 1.0
+            mant_bits[abs_e <= 7] = 2.0
+            mant_bits[abs_e <= 3] = 3.0
+            q = torch.floor(quant_abs * torch.exp2(-e + mant_bits) + 0.5)
+            finite_out[quant_mask] = q * torch.exp2(e - mant_bits) * quant_sign
+
+        out[finite_mask] = finite_out
+
+    return out.to(org_dtype)
+
+
+def hif8_decode_code_scalar(code):
+    """Decode one byte according to the HiF8 format definition."""
+    sign = (code >> 7) & 0x1
+    rem = code & 0x7F
+
+    if (rem & 0b1100000) == 0b1100000:  # 11 -> D=4
+        d, dot_len = 4, 2
+    elif (rem & 0b1100000) == 0b1000000:  # 10 -> D=3
+        d, dot_len = 3, 2
+    elif (rem & 0b1100000) == 0b0100000:  # 01 -> D=2
+        d, dot_len = 2, 2
+    elif (rem & 0b1110000) == 0b0010000:  # 001 -> D=1
+        d, dot_len = 1, 3
+    elif (rem & 0b1111000) == 0b0001000:  # 0001 -> D=0
+        d, dot_len = 0, 4
+    elif (rem & 0b1111000) == 0b0000000:  # 0000 -> DML
+        mant = rem & 0b111
+        if mant == 0:
+            return float('nan') if sign else 0.0
+        val = 2.0 ** (mant - 23)
+        return -val if sign else val
+    else:
+        return float('nan')
+
+    if d <= 2:
+        mant_width = 3
+    elif d == 3:
+        mant_width = 2
+    else:
+        mant_width = 1
+    tail_bits = 7 - dot_len
+    payload = rem & ((1 << tail_bits) - 1)
+    exp_bits = payload >> mant_width if d > 0 else 0
+    mant = payload & ((1 << mant_width) - 1)
+
+    if d == 0:
+        e_dec = 0
+    else:
+        se = (exp_bits >> (d - 1)) & 0x1
+        mag_tail = exp_bits & ((1 << (d - 1)) - 1) if d > 1 else 0
+        mag = (1 << (d - 1)) | mag_tail
+        e_dec = -mag if se else mag
+
+    if _is_hif8_inf_payload(e_dec, mant, mant_width):
+        return float('-inf') if sign else float('inf')
+
+    significand = 1.0 + mant / (2**mant_width)
+    val = significand * (2.0**e_dec)
+    return -val if sign else val
+
+
+@lru_cache(maxsize=None)
+def hif8_bucket_mse_ta(exponent, interval='full', sample_count=HIF8_HIBAND_BUCKET_SAMPLES):
+    exponent = int(exponent)
+    sample_count = max(int(sample_count), 1)
+
+    if interval == 'full':
+        lo = 2.0 ** exponent
+        hi = 2.0 ** (exponent + 1)
+    elif interval == 'safe_exp15':
+        if exponent != HIF8_MAX_NORMAL_EXP:
+            raise ValueError('safe_exp15 interval only applies to exponent 15')
+        lo = HIF8_MAX_FINITE
+        hi = HIF8_MAX_FINITE_TO_INF_TIE
+    else:
+        raise ValueError(f'Unsupported interval for HiF8 bucket MSE: {interval}')
+
+    grid = (torch.arange(sample_count, dtype=torch.float32) + 0.5) / float(sample_count)
+    samples = lo + (hi - lo) * grid
+    qdq = hif8_qdq_ta(samples)
+    if torch.isinf(qdq).any():
+        return float('inf')
+    return float((qdq.float() - samples).pow(2).mean().item())
 
 try:
     from qtorch.quant import float_quantize
@@ -1377,26 +1518,7 @@ class HiF8Quantizer(BaseQuantizer):
         self.qmax = None
 
     def _hif8_quant_dequant(self, tensor):
-        org_dtype = tensor.dtype
-        x = tensor.float()
-        x_unsigned = torch.abs(x)
-        sign = torch.sign(x)
-
-        eps = 2 ** (-14) if org_dtype == torch.float16 else 2 ** (-45)
-        e = torch.floor(torch.log2(x_unsigned + eps))
-
-        abse = e.abs()
-        mant_bits = torch.zeros_like(abse)
-        mant_bits[abse <= 15] = 1
-        mant_bits[abse <= 7] = 2
-        mant_bits[abse <= 3] = 3
-
-        qdq = (
-            torch.floor(x_unsigned * torch.exp2(-e + mant_bits) + 0.5)
-            * torch.exp2(e - mant_bits)
-            * sign
-        )
-        return qdq.to(org_dtype)
+        return hif8_qdq_ta(tensor)
 
     def fake_quant_act_static(self, act, args={}):
         q_act = act
@@ -1439,49 +1561,7 @@ class HiF8Quantizer(BaseQuantizer):
 
     @staticmethod
     def _decode_hif8_code_scalar(code):
-        """Decode one byte using the HiF8 prefix/dot/exponent/mantissa definition."""
-        sign = (code >> 7) & 0x1
-        rem = code & 0x7F  # 7 bits after sign
-
-        if (rem & 0b1100000) == 0b1000000:  # 10 -> D=3
-            d, dot_len = 3, 2
-        elif (rem & 0b1100000) == 0b0100000:  # 01 -> D=2
-            d, dot_len = 2, 2
-        elif (rem & 0b1110000) == 0b0010000:  # 001 -> D=1
-            d, dot_len = 1, 3
-        elif (rem & 0b1111000) == 0b0001000:  # 0001 -> D=0
-            d, dot_len = 0, 4
-        elif (rem & 0b1111000) == 0b0000000:  # 0000 -> DML
-            mant = rem & 0b111
-            if mant == 0:
-                return float('nan') if sign else 0.0
-            val = 2.0 ** (mant - 23)
-            return -val if sign else val
-        else:
-            # Should be unreachable. Keep a safe fallback for robustness.
-            return float('nan')
-
-        mant_width = 3 if d <= 2 else (2 if d == 3 else 1)
-        tail_bits = 7 - dot_len
-        payload = rem & ((1 << tail_bits) - 1)
-        exp_bits = payload >> mant_width if d > 0 else 0
-        mant = payload & ((1 << mant_width) - 1)
-
-        if d == 0:
-            e_dec = 0
-        else:
-            se = (exp_bits >> (d - 1)) & 0x1
-            mag_tail = exp_bits & ((1 << (d - 1)) - 1) if d > 1 else 0
-            mag = (1 << (d - 1)) | mag_tail  # implicit leading 1 in magnitude
-            e_dec = -mag if se else mag
-
-        # Two largest |normal| patterns are reserved for infinities.
-        if abs(e_dec) == 15 and mant == (1 << mant_width) - 1:
-            return float('-inf') if sign else float('inf')
-
-        significand = 1.0 + mant / (2**mant_width)
-        val = significand * (2.0**e_dec)
-        return -val if sign else val
+        return hif8_decode_code_scalar(code)
 
     @classmethod
     def _build_hif8_tables(cls, device):
@@ -1490,7 +1570,13 @@ class HiF8Quantizer(BaseQuantizer):
             cls._hif8_decode_table_cpu = torch.tensor(decode_vals, dtype=torch.float32)
 
             pos_pairs = []
+            pos_inf_code = None
+            neg_inf_code = None
             for code, val in enumerate(decode_vals):
+                if val == float('inf') and pos_inf_code is None:
+                    pos_inf_code = int(code)
+                elif val == float('-inf') and neg_inf_code is None:
+                    neg_inf_code = int(code)
                 if (
                     val is not None
                     and not (isinstance(val, float) and (val != val))
@@ -1512,11 +1598,21 @@ class HiF8Quantizer(BaseQuantizer):
                     last_val = v
             cls._hif8_pos_levels_cpu = torch.tensor(uniq_vals, dtype=torch.float32)
             cls._hif8_pos_codes_cpu = torch.tensor(uniq_codes, dtype=torch.uint8)
+            cls._hif8_pos_inf_code_cpu = torch.tensor(
+                0 if pos_inf_code is None else pos_inf_code,
+                dtype=torch.uint8,
+            )
+            cls._hif8_neg_inf_code_cpu = torch.tensor(
+                0 if neg_inf_code is None else neg_inf_code,
+                dtype=torch.uint8,
+            )
 
         return (
             cls._hif8_decode_table_cpu.to(device=device),
             cls._hif8_pos_levels_cpu.to(device=device),
             cls._hif8_pos_codes_cpu.to(device=device),
+            cls._hif8_pos_inf_code_cpu.to(device=device),
+            cls._hif8_neg_inf_code_cpu.to(device=device),
         )
 
     @classmethod
@@ -1525,7 +1621,7 @@ class HiF8Quantizer(BaseQuantizer):
         Pack HiF8-rounded floats to canonical HiF8 byte codes (uint8).
         """
         q = q_weight.float()
-        _, pos_levels, pos_codes = cls._build_hif8_tables(q.device)
+        _, pos_levels, pos_codes, pos_inf_code, neg_inf_code = cls._build_hif8_tables(q.device)
 
         flat = q.reshape(-1)
         abs_flat = flat.abs()
@@ -1549,6 +1645,8 @@ class HiF8Quantizer(BaseQuantizer):
 
         nan_code = torch.tensor(0x80, device=q.device, dtype=torch.uint8)  # DML + M=0 + sign=1
         codes = torch.where(torch.isnan(flat), nan_code, codes)
+        codes = torch.where(torch.isposinf(flat), pos_inf_code, codes)
+        codes = torch.where(torch.isneginf(flat), neg_inf_code, codes)
         return codes.view_as(q_weight)
 
     @staticmethod

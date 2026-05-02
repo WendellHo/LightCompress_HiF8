@@ -9,6 +9,7 @@ from llmc.utils.registry_factory import ALGO_REGISTRY
 
 from .base_blockwise_quantization import BaseBlockwiseQuantization
 from .module_utils import _LLMC_LN_TYPES_, _TRANSFORMERS_LN_TYPES_
+from .quant import HIF8_INF_TIE_RATIO, HIF8_MAX_NORMAL_EXP, hif8_bucket_mse_ta, hif8_qdq_ta
 
 
 @ALGO_REGISTRY
@@ -47,22 +48,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
 
     @torch.no_grad()
     def _hif8_qdq_like(self, tensor):
-        x = tensor.float()
-        x_unsigned = torch.abs(x)
-        sign = torch.sign(x)
-        eps = 2 ** (-45)
-        e = torch.floor(torch.log2(x_unsigned + eps))
-        abse = e.abs()
-        mant_bits = torch.zeros_like(abse)
-        mant_bits[abse <= 15] = 1
-        mant_bits[abse <= 7] = 2
-        mant_bits[abse <= 3] = 3
-        qdq = (
-            torch.floor(x_unsigned * torch.exp2(-e + mant_bits) + 0.5)
-            * torch.exp2(e - mant_bits)
-            * sign
-        )
-        return qdq.to(tensor.dtype)
+        return hif8_qdq_ta(tensor)
 
     @torch.no_grad()
     def _build_hiband_error_weight_table(self, min_e_prime, max_e_prime):
@@ -70,17 +56,16 @@ class SmoothQuant(BaseBlockwiseQuantization):
         W = torch.zeros(num_entries, dtype=torch.float32)
         for idx in range(num_entries):
             e_prime = min_e_prime + idx
-            abse = abs(e_prime)
-            if abse <= 3:
-                m = 3
-            elif abse <= 7:
-                m = 2
-            elif abse <= 15:
-                m = 1
+            if e_prime >= (HIF8_MAX_NORMAL_EXP + 1):
+                W[idx] = 0.0
+            elif e_prime == HIF8_MAX_NORMAL_EXP:
+                W[idx] = 0.0
             else:
-                m = 0
-            W[idx] = 2.0 ** (2 * (e_prime - m)) / 12.0
+                W[idx] = hif8_bucket_mse_ta(e_prime, interval='full')
         self._hiband_w_min_e = min_e_prime
+        self._hiband_exp15_safe_weight = hif8_bucket_mse_ta(
+            HIF8_MAX_NORMAL_EXP, interval='safe_exp15'
+        )
         return W
 
     @torch.no_grad()
@@ -102,7 +87,8 @@ class SmoothQuant(BaseBlockwiseQuantization):
         zero_count = (~nonzero_mask).sum(dim=0).to(torch.float32)
         if not bool(nonzero_mask.any().item()):
             hist = torch.zeros((samples.shape[1], 1), dtype=torch.float32, device=samples.device)
-            return offset, hist, zero_count, 0
+            overflow_tail_hist = torch.zeros_like(hist)
+            return offset, hist, overflow_tail_hist, zero_count, 0
 
         exponents = torch.floor(torch.log2(abs_samples.clamp(min=self.hiband_eps))).to(torch.int32)
         nonzero_exp = exponents[nonzero_mask]
@@ -122,7 +108,15 @@ class SmoothQuant(BaseBlockwiseQuantization):
             0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32)
         )
         hist = hist_flat.view(samples.shape[1], hist_bins)
-        return offset, hist, zero_count, min_exp
+        bin_base = torch.exp2(exponents.to(torch.float32))
+        overflow_tail_mask = nonzero_mask & (abs_samples >= HIF8_INF_TIE_RATIO * bin_base)
+        overflow_tail_flat = torch.zeros_like(hist_flat)
+        overflow_tail_indices = flat_indices[overflow_tail_mask[nonzero_mask]]
+        overflow_tail_flat.scatter_add_(
+            0, overflow_tail_indices, torch.ones_like(overflow_tail_indices, dtype=torch.float32)
+        )
+        overflow_tail_hist = overflow_tail_flat.view(samples.shape[1], hist_bins)
+        return offset, hist, overflow_tail_hist, zero_count, min_exp
 
     @torch.no_grad()
     def _build_uniform_budgets(self, bucket_count, total_budget):
@@ -265,7 +259,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
             return None
 
         samples = samples.to(torch.float32)
-        offset, hist, _zero_count, min_exp = self._build_hiband_histogram(samples)
+        offset, hist, overflow_tail_hist, _zero_count, min_exp = self._build_hiband_histogram(samples)
         num_channels = hist.shape[0]
         hist_bins = hist.shape[1]
         N_c = samples.shape[0]
@@ -286,6 +280,21 @@ class SmoothQuant(BaseBlockwiseQuantization):
         w_idx = (e_prime - self._hiband_w_min_e).clamp(min=0, max=W.shape[0] - 1)
         weight_table = W[w_idx.long()]
         analytical_mse_scaled = torch.einsum('icb,cb->ic', weight_table, hist) / N_c
+        exp15_mask = (e_prime == HIF8_MAX_NORMAL_EXP).to(torch.float32)
+        safe_exp15_hist = (hist - overflow_tail_hist).clamp(min=0.0)
+        safe_exp15_count = torch.einsum('icb,cb->ic', exp15_mask, safe_exp15_hist)
+        analytical_mse_scaled = analytical_mse_scaled + (
+            safe_exp15_count * self._hiband_exp15_safe_weight / N_c
+        )
+        overflow_full_mask = (e_prime >= (HIF8_MAX_NORMAL_EXP + 1)).to(torch.float32)
+        overflow_full_count = torch.einsum('icb,cb->ic', overflow_full_mask, hist)
+        overflow_tail_count = torch.einsum('icb,cb->ic', exp15_mask, overflow_tail_hist)
+        overflow_present = (overflow_full_count + overflow_tail_count) > 0
+        analytical_mse_scaled = torch.where(
+            overflow_present,
+            torch.full_like(analytical_mse_scaled, float('inf')),
+            analytical_mse_scaled,
+        )
         scale_sq = torch.pow(2.0, 2.0 * candidate.to(torch.float32))
         analytical_mse = analytical_mse_scaled * scale_sq
         viz_topk = min(3, candidate_count)

@@ -26,8 +26,16 @@ else:
 
 try:
     from vllm import _custom_ops as ops
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     ops = None
+
+
+def _require_vllm_ops():
+    if ops is None:
+        raise RuntimeError(
+            'VLLM custom ops are unavailable. Install a compatible `vllm` build '
+            'if you need VLLM int8/fp8 quantization or inference export.'
+        )
 
 try:
     import fast_hadamard_transform
@@ -330,6 +338,7 @@ class VllmQuantLinearInt8(nn.Module):
             self.register_buffer('bias', None)
 
     def act_quant_func(self, x):
+        _require_vllm_ops()
         input_tensor_quant, input_tensor_scale, _ \
             = ops.scaled_int8_quant(x, scale=None, azp=None, symmetric=True)
         return input_tensor_quant, input_tensor_scale
@@ -375,6 +384,7 @@ class VllmQuantLinearFp8(nn.Module):
             self.register_buffer('bias', None)
 
     def act_quant_func(self, x):
+        _require_vllm_ops()
         input_tensor_quant, input_tensor_scale \
             = ops.scaled_fp8_quant(x, None, scale_ub=None, use_per_token_if_dynamic=True)
         return input_tensor_quant, input_tensor_scale
