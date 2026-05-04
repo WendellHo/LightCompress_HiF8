@@ -9,7 +9,15 @@ from llmc.utils.registry_factory import ALGO_REGISTRY
 
 from .base_blockwise_quantization import BaseBlockwiseQuantization
 from .module_utils import _LLMC_LN_TYPES_, _TRANSFORMERS_LN_TYPES_
-from .quant import HIF8_INF_TIE_RATIO, HIF8_MAX_NORMAL_EXP, hif8_bucket_mse_ta, hif8_qdq_ta
+from .quant import (
+    HIF8_HIBAND_FIXED_BINS,
+    HIF8_HIBAND_FIXED_MAX_EXP,
+    HIF8_HIBAND_FIXED_MIN_EXP,
+    HIF8_INF_TIE_RATIO,
+    HIF8_MAX_NORMAL_EXP,
+    hif8_bucket_mse_ta,
+    hif8_qdq_ta,
+)
 
 
 @ALGO_REGISTRY
@@ -49,6 +57,117 @@ class SmoothQuant(BaseBlockwiseQuantization):
     @torch.no_grad()
     def _hif8_qdq_like(self, tensor):
         return hif8_qdq_ta(tensor)
+
+    @torch.no_grad()
+    def _init_hiband_histogram_state(self, num_channels, device):
+        hist = torch.zeros(
+            (num_channels, HIF8_HIBAND_FIXED_BINS),
+            dtype=torch.float32,
+            device=device,
+        )
+        overflow_tail_hist = torch.zeros_like(hist)
+        zero_count = torch.zeros(num_channels, dtype=torch.float32, device=device)
+        channel_max = torch.zeros(num_channels, dtype=torch.float32, device=device)
+        return {
+            'hist': hist,
+            'overflow_tail_hist': overflow_tail_hist,
+            'zero_count': zero_count,
+            'channel_max': channel_max,
+            'N_c': 0,
+            'num_channels': num_channels,
+            'device': device,
+        }
+
+    @torch.no_grad()
+    def _incremental_update_hiband_histogram(self, state, chunk):
+        chunk = chunk.to(torch.float32)
+        abs_chunk = chunk.abs()
+        num_channels = state['num_channels']
+        if abs_chunk.shape[-1] != num_channels:
+            return
+
+        state['channel_max'] = torch.maximum(
+            state['channel_max'], abs_chunk.amax(dim=0)
+        )
+
+        nonzero_mask = abs_chunk > self.hiband_eps
+        state['zero_count'] += (~nonzero_mask).sum(dim=0).to(torch.float32)
+        state['N_c'] += chunk.shape[0]
+
+        if not bool(nonzero_mask.any().item()):
+            return
+
+        exponents = torch.floor(
+            torch.log2(abs_chunk.clamp(min=self.hiband_eps))
+        ).to(torch.int32)
+        bin_idx = (exponents - HIF8_HIBAND_FIXED_MIN_EXP).to(torch.long)
+        in_range = (bin_idx >= 0) & (bin_idx < HIF8_HIBAND_FIXED_BINS) & nonzero_mask
+
+        nz_row, nz_col = in_range.nonzero(as_tuple=True)
+        if nz_row.numel() > 0:
+            nz_bins = bin_idx[nz_row, nz_col]
+            flat_idx = nz_col * HIF8_HIBAND_FIXED_BINS + nz_bins
+            chunk_hist = torch.zeros(
+                num_channels * HIF8_HIBAND_FIXED_BINS,
+                dtype=torch.float32,
+                device=state['device'],
+            )
+            chunk_hist.scatter_add_(
+                0, flat_idx, torch.ones_like(flat_idx, dtype=torch.float32)
+            )
+            state['hist'] += chunk_hist.view(num_channels, HIF8_HIBAND_FIXED_BINS)
+
+        bin_base = torch.exp2(exponents.to(torch.float32))
+        overflow_tail_mask = nonzero_mask & (abs_chunk >= HIF8_INF_TIE_RATIO * bin_base)
+        ot_nz_row, ot_nz_col = (in_range & overflow_tail_mask).nonzero(as_tuple=True)
+        if ot_nz_row.numel() > 0:
+            ot_bins = bin_idx[ot_nz_row, ot_nz_col]
+            ot_flat_idx = ot_nz_col * HIF8_HIBAND_FIXED_BINS + ot_bins
+            ot_chunk_hist = torch.zeros(
+                num_channels * HIF8_HIBAND_FIXED_BINS,
+                dtype=torch.float32,
+                device=state['device'],
+            )
+            ot_chunk_hist.scatter_add_(
+                0, ot_flat_idx, torch.ones_like(ot_flat_idx, dtype=torch.float32)
+            )
+            state['overflow_tail_hist'] += ot_chunk_hist.view(
+                num_channels, HIF8_HIBAND_FIXED_BINS
+            )
+
+    @torch.no_grad()
+    def _finalize_hiband_histogram_state(self, state):
+        if state['N_c'] == 0:
+            num_channels = state['num_channels']
+            device = state['device']
+            offset = torch.zeros(num_channels, dtype=torch.int32, device=device)
+            hist = torch.zeros((num_channels, 1), dtype=torch.float32, device=device)
+            overflow_tail_hist = torch.zeros_like(hist)
+            zero_count = torch.zeros(num_channels, dtype=torch.float32, device=device)
+            return offset, hist, overflow_tail_hist, zero_count, 0, 0
+
+        if self.hiband_use_offset:
+            nonzero_channel = state['channel_max'] > self.hiband_eps
+            offset = torch.where(
+                nonzero_channel,
+                torch.round(
+                    torch.log2(state['channel_max'].clamp(min=self.hiband_eps))
+                ).to(torch.int32),
+                torch.zeros_like(state['channel_max'], dtype=torch.int32),
+            )
+        else:
+            offset = torch.zeros(
+                state['num_channels'], dtype=torch.int32, device=state['device']
+            )
+
+        return (
+            offset,
+            state['hist'],
+            state['overflow_tail_hist'],
+            state['zero_count'],
+            HIF8_HIBAND_FIXED_MIN_EXP,
+            state['N_c'],
+        )
 
     @torch.no_grad()
     def _build_hiband_error_weight_table(self, min_e_prime, max_e_prime):
@@ -354,6 +473,160 @@ class SmoothQuant(BaseBlockwiseQuantization):
         )
         hiband_scale = torch.pow(2.0, best_k.to(torch.float32)).clamp(min=self.hiband_eps)
         return hiband_scale.to(device=target_device, dtype=target_dtype)
+
+    @torch.no_grad()
+    def _search_hiband_scale_from_histogram(
+        self, offset, hist, overflow_tail_hist, zero_count, min_exp, N_c,
+        target_device, target_dtype, side,
+    ):
+        if N_c == 0 or hist.numel() == 0:
+            return None
+
+        num_channels = hist.shape[0]
+        hist_bins = hist.shape[1]
+        candidate = torch.arange(
+            self.hiband_k_min, self.hiband_k_max + 1, device=hist.device, dtype=torch.int32
+        ).view(-1, 1) + offset.view(1, -1)
+        candidate_count = candidate.shape[0]
+
+        max_exp = min_exp + hist_bins - 1
+        cand_min = int(candidate.min().item())
+        cand_max = int(candidate.max().item())
+        min_e_prime = min_exp - cand_max
+        max_e_prime = max_exp - cand_min
+        W = self._build_hiband_error_weight_table(min_e_prime, max_e_prime).to(device=hist.device)
+
+        bin_exp = torch.arange(hist_bins, device=hist.device, dtype=torch.int32) + min_exp
+        e_prime = bin_exp.view(1, 1, -1) - candidate.unsqueeze(2)
+        w_idx = (e_prime - self._hiband_w_min_e).clamp(min=0, max=W.shape[0] - 1)
+        weight_table = W[w_idx.long()]
+        analytical_mse_scaled = torch.einsum('icb,cb->ic', weight_table, hist) / N_c
+        exp15_mask = (e_prime == HIF8_MAX_NORMAL_EXP).to(torch.float32)
+        safe_exp15_hist = (hist - overflow_tail_hist).clamp(min=0.0)
+        safe_exp15_count = torch.einsum('icb,cb->ic', exp15_mask, safe_exp15_hist)
+        analytical_mse_scaled = analytical_mse_scaled + (
+            safe_exp15_count * self._hiband_exp15_safe_weight / N_c
+        )
+        overflow_full_mask = (e_prime >= (HIF8_MAX_NORMAL_EXP + 1)).to(torch.float32)
+        overflow_full_count = torch.einsum('icb,cb->ic', overflow_full_mask, hist)
+        overflow_tail_count = torch.einsum('icb,cb->ic', exp15_mask, overflow_tail_hist)
+        overflow_present = (overflow_full_count + overflow_tail_count) > 0
+        analytical_mse_scaled = torch.where(
+            overflow_present,
+            torch.full_like(analytical_mse_scaled, float('inf')),
+            analytical_mse_scaled,
+        )
+        scale_sq = torch.pow(2.0, 2.0 * candidate.to(torch.float32))
+        analytical_mse = analytical_mse_scaled * scale_sq
+        viz_topk = min(3, candidate_count)
+        topk_for_viz = candidate.gather(
+            0,
+            analytical_mse.topk(viz_topk, dim=0, largest=False).indices,
+        )
+        k_anchor = torch.zeros(num_channels, device=hist.device, dtype=torch.int32)
+        best_idx = analytical_mse.argmin(dim=0)
+        best_k = candidate.gather(0, best_idx.unsqueeze(0)).squeeze(0)
+        best_analytical = analytical_mse.gather(0, best_idx.unsqueeze(0)).squeeze(0)
+        close_mask = torch.isclose(analytical_mse, best_analytical.unsqueeze(0))
+        tie_dist = (candidate - k_anchor.unsqueeze(0)).abs().to(torch.float32)
+        tie_dist = torch.where(
+            close_mask, tie_dist, torch.full_like(tie_dist, float('inf'))
+        )
+        tie_idx = tie_dist.argmin(dim=0)
+        best_k = candidate.gather(0, tie_idx.unsqueeze(0)).squeeze(0)
+
+        self._maybe_visualize_hiband_histograms(
+            hist=hist,
+            min_exp=min_exp,
+            offset=offset,
+            topk_candidates=topk_for_viz,
+            best_k=best_k,
+            side=side,
+        )
+        hiband_scale = torch.pow(2.0, best_k.to(torch.float32)).clamp(min=self.hiband_eps)
+        return hiband_scale.to(device=target_device, dtype=target_dtype)
+
+    @torch.no_grad()
+    def _collect_hiband_histogram(self, tensors, scale):
+        num_steps = self._resolve_hiband_num_steps(len(tensors))
+        step_buckets = self._split_by_timestep(tensors, num_steps)
+        num_channels = None
+        for bucket in step_buckets:
+            for tensor in bucket:
+                if tensor.shape[-1] > 0:
+                    num_channels = tensor.shape[-1]
+                    break
+            if num_channels is not None:
+                break
+        if num_channels is None:
+            return None
+
+        state = self._init_hiband_histogram_state(num_channels, device='cpu')
+        for bucket in step_buckets:
+            if len(bucket) == 0:
+                continue
+            for tensor in bucket:
+                if tensor.shape[-1] == 0:
+                    continue
+                shape = [1] * (tensor.dim() - 1) + [-1]
+                post = tensor / scale.to(device=tensor.device, dtype=tensor.dtype).view(*shape)
+                post = post.view(-1, post.shape[-1]).detach().to(torch.float32).cpu()
+                chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
+                for start in range(0, post.shape[0], chunk_size):
+                    chunk = post[start:start + chunk_size]
+                    self._incremental_update_hiband_histogram(state, chunk)
+                del post
+
+        result = self._finalize_hiband_histogram_state(state)
+        if result[5] == 0:
+            return None
+        return result
+
+    @torch.no_grad()
+    def _collect_hiband_histogram_stream(self, stream_stats, input_name, scale):
+        if self._current_block is None:
+            raise ValueError('SmoothQuant stream_stats HiBand requires current block context.')
+
+        stream_state = {'idx': 0}
+        scale_cpu = scale.detach().to(torch.float32).cpu()
+        num_steps = self._resolve_hiband_num_steps()
+        hist_state = [None]
+
+        def collect_hiband_histogram_hook(_, x, _output):
+            stream_state['idx'] += 1
+            if len(x) == 0 or not torch.is_tensor(x[0]):
+                return
+
+            inp = x[0].detach()
+            if len(inp.shape) == 2:
+                inp = inp.unsqueeze(0)
+            shape = [1] * (inp.dim() - 1) + [-1]
+            post = inp / scale_cpu.to(device=inp.device, dtype=inp.dtype).view(*shape)
+            post = post.view(-1, post.shape[-1]).to(torch.float32).cpu()
+
+            if hist_state[0] is None:
+                hist_state[0] = self._init_hiband_histogram_state(
+                    post.shape[-1], device='cpu'
+                )
+            chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
+            for start in range(0, post.shape[0], chunk_size):
+                chunk = post[start:start + chunk_size]
+                self._incremental_update_hiband_histogram(hist_state[0], chunk)
+            del post
+
+        layer = dict(self._current_block.named_modules())[input_name]
+        handle = layer.register_forward_hook(collect_hiband_histogram_hook)
+        try:
+            self.block_forward(self._current_block, collect_output=False)
+        finally:
+            handle.remove()
+
+        if hist_state[0] is None:
+            return None
+        result = self._finalize_hiband_histogram_state(hist_state[0])
+        if result[5] == 0:
+            return None
+        return result
 
     @torch.no_grad()
     def _collect_hiband_act_samples(self, tensors, scale):
@@ -735,15 +1008,36 @@ class SmoothQuant(BaseBlockwiseQuantization):
         hiband_act_scale = None
         hiband_weight_scales = {}
         if self.hiband_enabled:
-            if self.stream_stats and isinstance(input_feat[input_name], dict):
-                act_samples = self._collect_hiband_act_samples_stream(
-                    input_feat[input_name], input_name, scale
+            needs_act_samples = (
+                self.hiband_use_true_qdq_mse
+                or (not is_attn_o and self.hiband_weight_scale_enabled)
+            )
+            if needs_act_samples:
+                if self.stream_stats and isinstance(input_feat[input_name], dict):
+                    act_samples = self._collect_hiband_act_samples_stream(
+                        input_feat[input_name], input_name, scale
+                    )
+                else:
+                    act_samples = self._collect_hiband_act_samples(input_feat[input_name], scale)
+                hiband_act_scale = self._search_hiband_scale(
+                    act_samples, scale.device, scale.dtype, side='act'
                 )
             else:
-                act_samples = self._collect_hiband_act_samples(input_feat[input_name], scale)
-            hiband_act_scale = self._search_hiband_scale(
-                act_samples, scale.device, scale.dtype, side='act'
-            )
+                act_samples = None
+                if self.stream_stats and isinstance(input_feat[input_name], dict):
+                    hist_result = self._collect_hiband_histogram_stream(
+                        input_feat[input_name], input_name, scale
+                    )
+                else:
+                    hist_result = self._collect_hiband_histogram(
+                        input_feat[input_name], scale
+                    )
+                if hist_result is not None:
+                    offset, hist, overflow_tail_hist, zero_count, min_exp, N_c = hist_result
+                    hiband_act_scale = self._search_hiband_scale_from_histogram(
+                        offset, hist, overflow_tail_hist, zero_count, min_exp, N_c,
+                        scale.device, scale.dtype, side='act',
+                    )
             if (
                 not is_attn_o
                 and self.hiband_weight_scale_enabled
