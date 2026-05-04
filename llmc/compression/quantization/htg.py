@@ -13,7 +13,6 @@ from .base_blockwise_quantization import BaseBlockwiseQuantization
 from .module_utils import _LLMC_LN_TYPES_, _TRANSFORMERS_LN_TYPES_
 from .quant import (
     HIF8_HIBAND_FIXED_BINS,
-    HIF8_HIBAND_FIXED_MAX_EXP,
     HIF8_HIBAND_FIXED_MIN_EXP,
     HIF8_INF_TIE_RATIO,
     HIF8_MAX_NORMAL_EXP,
@@ -132,11 +131,11 @@ class HTG(BaseBlockwiseQuantization):
             torch.log2(abs_chunk.clamp(min=self.hiband_eps))
         ).to(torch.int32)
         bin_idx = (exponents - HIF8_HIBAND_FIXED_MIN_EXP).to(torch.long)
-        in_range = (bin_idx >= 0) & (bin_idx < HIF8_HIBAND_FIXED_BINS) & nonzero_mask
+        clamped_bin_idx = bin_idx.clamp(min=0, max=HIF8_HIBAND_FIXED_BINS - 1)
 
-        nz_row, nz_col = in_range.nonzero(as_tuple=True)
+        nz_row, nz_col = nonzero_mask.nonzero(as_tuple=True)
         if nz_row.numel() > 0:
-            nz_bins = bin_idx[nz_row, nz_col]
+            nz_bins = clamped_bin_idx[nz_row, nz_col]
             flat_idx = nz_col * HIF8_HIBAND_FIXED_BINS + nz_bins
             chunk_hist = torch.zeros(
                 num_channels * HIF8_HIBAND_FIXED_BINS,
@@ -150,9 +149,9 @@ class HTG(BaseBlockwiseQuantization):
 
         bin_base = torch.exp2(exponents.to(torch.float32))
         overflow_tail_mask = nonzero_mask & (abs_chunk >= HIF8_INF_TIE_RATIO * bin_base)
-        ot_nz_row, ot_nz_col = (in_range & overflow_tail_mask).nonzero(as_tuple=True)
+        ot_nz_row, ot_nz_col = overflow_tail_mask.nonzero(as_tuple=True)
         if ot_nz_row.numel() > 0:
-            ot_bins = bin_idx[ot_nz_row, ot_nz_col]
+            ot_bins = clamped_bin_idx[ot_nz_row, ot_nz_col]
             ot_flat_idx = ot_nz_col * HIF8_HIBAND_FIXED_BINS + ot_bins
             ot_chunk_hist = torch.zeros(
                 num_channels * HIF8_HIBAND_FIXED_BINS,
