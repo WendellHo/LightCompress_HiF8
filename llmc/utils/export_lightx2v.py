@@ -14,7 +14,7 @@ def _has_hif8_quant(config):
     return False
 
 
-def update_lightx2v_quant_config(save_quant_path, config=None):
+def update_lightx2v_quant_config(save_quant_path, config=None, hif8_export_mode='native_u8'):
     def _cfg_get(obj, key, default=None):
         if obj is None:
             return default
@@ -42,10 +42,16 @@ def update_lightx2v_quant_config(save_quant_path, config=None):
         hiband_cfg = _get_hiband_special_cfg(config)
         hiband_enabled = bool(hiband_cfg.get('enabled', False))
         config_lightx2v['dit_quantized'] = True
-        config_lightx2v['dit_quant_scheme'] = 'hif8-cuda'
+        use_fake_bf16 = str(hif8_export_mode).lower() == 'fake_bf16'
+        config_lightx2v['dit_quant_scheme'] = (
+            'hif8-fake-bf16' if use_fake_bf16 else 'hif8-cuda'
+        )
         config_lightx2v['hif8_format_version'] = 2
-        # Phase-3 interface metadata for native HiF8 bit packing.
-        config_lightx2v['hif8_storage_dtype'] = 'uint8_hif8'
+        # Keep runtime metadata explicit so LightX2V can select the proper
+        # weight container path without affecting existing native-u8 exports.
+        config_lightx2v['hif8_storage_dtype'] = (
+            'bf16_hif8_fake' if use_fake_bf16 else 'uint8_hif8'
+        )
         config_lightx2v['hif8_weight_scale_granularity'] = 'none'
         hif8_runtime = {
             'enable_input_qdq': True,

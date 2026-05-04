@@ -189,7 +189,12 @@ class LlmcWanTransformerBlock(nn.Module):
                 if group_scales.dim() == 1:
                     selected = group_scales
                 elif group_scales.shape[0] > 0:
-                    idx = max(0, min(group_idx, group_scales.shape[0] - 1))
+                    layer_boundaries = getattr(layer, 'htg_group_boundaries', None)
+                    if layer_boundaries is not None and layer_boundaries.numel() > 0:
+                        layer_group_idx = get_group_idx(layer_boundaries)
+                    else:
+                        layer_group_idx = group_idx
+                    idx = max(0, min(layer_group_idx, group_scales.shape[0] - 1))
                     selected = group_scales[idx]
                 else:
                     continue
@@ -1271,6 +1276,107 @@ class Lightx2vHiF8RealQuantLinear(VllmRealQuantLinear):
         )
 
 
+class Lightx2vHiF8FakeQuantLinear(VllmRealQuantLinear):
+    """
+    Export path for LightX2V HiF8 fake-quant checkpoints.
+
+    Unlike native HiF8 export, weights are materialized offline as bf16 tensors
+    that already lie on HiF8 fake-quant levels. Runtime therefore only needs to
+    apply input-side HiF8 QDQ / HiBand logic and can use the stored weights
+    directly without uint8 decode.
+    """
+
+    def __init__(
+        self,
+        weight,
+        bias,
+        scales,
+        input_scale,
+        need_pack,
+        scales_name,
+        hiband_act_scale=None,
+        hiband_group_act_scales=None,
+    ):
+        super().__init__(
+            weight,
+            bias,
+            scales,
+            input_scale,
+            need_pack,
+            scales_name,
+            hiband_act_scale=hiband_act_scale,
+            hiband_group_act_scales=hiband_group_act_scales,
+        )
+
+    @staticmethod
+    def _dummy_hif8_scale(weight):
+        if weight.dim() == 1:
+            return torch.ones((1, 1), dtype=torch.float32, device=weight.device)
+        return torch.ones(
+            (weight.shape[0], 1), dtype=torch.float32, device=weight.device
+        )
+
+    @classmethod
+    @torch.no_grad()
+    def new(cls, module, w_qdq, quant_config):
+        weight, scales = cls.quant_pack(module, w_qdq, quant_config)
+        if hasattr(module, 'buf_act_scales_0'):
+            input_scale = module.buf_act_scales_0
+        else:
+            input_scale = None
+        hiband_act_scale = getattr(module, 'hiband_act_scale', None)
+        hiband_group_act_scales = getattr(module, 'hiband_group_act_scales', None)
+
+        if module.bias is not None:
+            bias = module.bias.data
+        else:
+            bias = None
+
+        scales_name = 'weight_scale'
+
+        new_module = cls(
+            weight,
+            bias,
+            scales,
+            input_scale,
+            False,
+            scales_name,
+            hiband_act_scale=hiband_act_scale,
+            hiband_group_act_scales=hiband_group_act_scales,
+        )
+        new_module.in_features = module.in_features
+        new_module.out_features = module.out_features
+        new_module.weight_shape = weight.shape
+        new_module.weight_dtype = weight.dtype
+        new_module.scales_shape = scales.shape
+        new_module.scales_dtype = scales.dtype
+        new_module.zeros_shape = None
+        new_module.zeros_dtype = None
+        return new_module
+
+    @classmethod
+    @torch.no_grad()
+    def quant_pack(cls, module, w_qdq, quant_config):
+        del quant_config
+        weight = w_qdq(module).to(torch.bfloat16)
+        scales = cls._dummy_hif8_scale(weight)
+        return weight, scales
+
+    def __repr__(self):
+        return (
+            'Lightx2vHiF8FakeQuantLinear('
+            + f'in_features={self.in_features}, '
+            + f'out_features={self.out_features}, '
+            + f'bias={self.bias is not None}, '
+            + f'weight_shape={self.weight_shape}, '
+            + f'weight_dtype={self.weight_dtype}, '
+            + f'scales_shape={self.scales_shape}, '
+            + f'scales_dtype={self.scales_dtype}, '
+            + f'zeros_shape={self.zeros_shape}, '
+            + f'zeros_dtype={self.zeros_dtype})'
+        )
+
+
 class SglRealQuantLinear(VllmRealQuantLinear):
     def __init__(
         self,
@@ -1503,6 +1609,7 @@ _LLMC_LINEAR_TYPES_ = [
     MlcllmRealQuantLinear,
     LightllmRealQuantLinear,
     Lightx2vHiF8RealQuantLinear,
+    Lightx2vHiF8FakeQuantLinear,
 ]
 
 _REALQUANT_LINEAR_MAP_ = {
@@ -1513,4 +1620,5 @@ _REALQUANT_LINEAR_MAP_ = {
     'mlcllm_quant': MlcllmRealQuantLinear,
     'lightx2v_quant': Lightx2vRealQuantLinear,
     'lightx2v_hif8_quant': Lightx2vHiF8RealQuantLinear,
+    'lightx2v_hif8_fake_quant': Lightx2vHiF8FakeQuantLinear,
 }

@@ -108,6 +108,24 @@ def main(config):
             deploy_all_modality(blockwise_opts, 'fake_quant')
             blockwise_opt.save_model(save_fake_path)
 
+        if 'save' in config and config.save.get('save_fake_lightx2v', False):
+            has_hif8_quant = False
+            for modality_config in modality_configs:
+                weight_quant_type = modality_config.weight.get(
+                    'quant_type', 'int-quant'
+                )
+                if weight_quant_type in ['hif8-quant', 'hif8']:
+                    has_hif8_quant = True
+                    break
+            assert has_hif8_quant, 'save_fake_lightx2v only supports HiF8 quant.'
+            deploy_all_modality(blockwise_opts, 'lightx2v_hif8_fake_quant')
+            blockwise_opt.save_model(save_fake_lightx2v_path)
+            update_lightx2v_quant_config(
+                save_fake_lightx2v_path,
+                config,
+                hif8_export_mode='fake_bf16',
+            )
+
         if 'save' in config:
             if (
                 config.save.get('save_vllm', False)
@@ -290,6 +308,11 @@ if __name__ == '__main__':
             if config.save.get('save_fake', False):
                 save_fake_path = os.path.join(config.save.save_path, 'fake_quant_model')
                 mkdirs(save_fake_path)
+            if config.save.get('save_fake_lightx2v', False):
+                save_fake_lightx2v_path = os.path.join(
+                    config.save.save_path, 'lightx2v_fake_quant_model'
+                )
+                mkdirs(save_fake_lightx2v_path)
 
     # Synchronize all processes after directory creation
     dist.barrier()

@@ -1280,6 +1280,40 @@ class HTG(BaseBlockwiseQuantization):
 
         if is_attn_o:
             scale = scale.to(dtype=layers[0].weight.dtype, device=layers[0].weight.device)
+            hiband_act_scale = None
+            hiband_group_act_scales = None
+            if self.hiband_enabled:
+                if self.stream_stats and isinstance(tensors, dict):
+                    act_samples = self._collect_hiband_act_samples_stream(
+                        tensors, z_g, step_to_group, input_name, num_steps, scale
+                    )
+                else:
+                    act_samples = self._collect_hiband_act_samples(
+                        tensors, num_steps, step_to_group, z_g, scale
+                    )
+                hiband_act_scale = self._search_hiband_scale(
+                    act_samples, scale.device, scale.dtype, side='act'
+                )
+                if hiband_act_scale is not None:
+                    self._attach_hiband_act_scale(layers, hiband_act_scale)
+                if (
+                    self.hiband_runtime_group_act_scale_enabled
+                    and self.hiband_group_source == 'htg'
+                    and hiband_act_scale is not None
+                ):
+                    if self.stream_stats and isinstance(tensors, dict):
+                        grouped_act_samples = self._collect_hiband_group_act_samples_stream(
+                            tensors, z_g, step_to_group, input_name, num_steps, scale, group_num
+                        )
+                    else:
+                        grouped_act_samples = self._collect_hiband_group_act_samples(
+                            tensors, num_steps, step_to_group, z_g, scale, group_num
+                        )
+                    hiband_group_act_scales = self._search_hiband_group_act_scales(
+                        grouped_act_samples, hiband_act_scale, scale.device, scale.dtype
+                    )
+                    if hiband_group_act_scales is not None:
+                        self._attach_hiband_group_act_scales(layers, hiband_group_act_scales)
             if self.enable_dynamic_runtime:
                 for layer in layers:
                     layer.weight.mul_(scale.view(1, -1))
@@ -1311,6 +1345,12 @@ class HTG(BaseBlockwiseQuantization):
                 self.act_shifts[key] = shift.detach().cpu()
             if self.save_scale:
                 self.act_scales[key] = scale.detach().cpu()
+            if self.hiband_enabled and hiband_act_scale is not None:
+                self.hiband_act_scales[key] = hiband_act_scale.detach().cpu()
+            if self.hiband_enabled and hiband_group_act_scales is not None:
+                self.hiband_group_act_scales[key] = (
+                    hiband_group_act_scales.detach().cpu()
+                )
             return
 
         scale = scale.to(dtype=prev_op[0].weight.dtype, device=prev_op[0].weight.device)

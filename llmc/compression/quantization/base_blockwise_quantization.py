@@ -119,6 +119,10 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             )
             params_dict['w_qdq'] = partial(self.w_qdq, wquantizer=self.wquantizer)
 
+        elif mode == 'lightx2v_hif8_fake_quant':
+            params_dict['w_qdq'] = partial(self.w_qdq, wquantizer=self.wquantizer)
+            params_dict['quant_config'] = self.quant_config
+
         elif mode in _REALQUANT_LINEAR_MAP_.keys():
             params_dict['w_q'] = partial(self.w_q, wquantizer=self.wquantizer)
             params_dict['quant_config'] = self.quant_config

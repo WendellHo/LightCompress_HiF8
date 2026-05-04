@@ -612,6 +612,10 @@ class SmoothQuant(BaseBlockwiseQuantization):
             return False
 
     @torch.no_grad()
+    def _is_attn_o_subset(self, subset):
+        return bool(subset.get('is_attn_o', False))
+
+    @torch.no_grad()
     def get_weight_scale(self, layers):
         weights = self.collect_layers_weights(layers)
         scale = torch.cat(
@@ -714,12 +718,20 @@ class SmoothQuant(BaseBlockwiseQuantization):
         layers_dict = subset['layers']
         prev_op = subset['prev_op']
         input_name = subset['input'][0]
+        is_attn_o = self._is_attn_o_subset(subset)
 
-        if not self.filter_subset(prev_op):
+        if not is_attn_o and not self.filter_subset(prev_op):
             logger.info('Do not transform this subset.')
             return
         layers = list(layers_dict.values())
-        scale = self.search_scale_subset(layers, input_feat[input_name])
+        if is_attn_o:
+            scale = torch.ones(
+                layers[0].weight.shape[-1],
+                device=layers[0].weight.device,
+                dtype=layers[0].weight.dtype,
+            )
+        else:
+            scale = self.search_scale_subset(layers, input_feat[input_name])
         hiband_act_scale = None
         hiband_weight_scales = {}
         if self.hiband_enabled:
@@ -732,7 +744,11 @@ class SmoothQuant(BaseBlockwiseQuantization):
             hiband_act_scale = self._search_hiband_scale(
                 act_samples, scale.device, scale.dtype, side='act'
             )
-            if self.hiband_weight_scale_enabled and hiband_act_scale is not None:
+            if (
+                not is_attn_o
+                and self.hiband_weight_scale_enabled
+                and hiband_act_scale is not None
+            ):
                 hiband_weight_scales = self._search_hiband_weight_scales(
                     layers,
                     scale,
@@ -743,11 +759,12 @@ class SmoothQuant(BaseBlockwiseQuantization):
                 )
             if hiband_act_scale is not None:
                 self._attach_hiband_act_scale(layers, hiband_act_scale)
-        self.apply_scale(scale, prev_op, layers)
-        for layer, layer_scale in hiband_weight_scales.items():
-            self._apply_hiband_weight_scale(layer, layer_scale)
-        if self.act_static:
-            self.update_input_feat(scale, input_feat, layers_dict, False)
+        if not is_attn_o:
+            self.apply_scale(scale, prev_op, layers)
+            for layer, layer_scale in hiband_weight_scales.items():
+                self._apply_hiband_weight_scale(layer, layer_scale)
+            if self.act_static:
+                self.update_input_feat(scale, input_feat, layers_dict, False)
         if self.hiband_enabled and hiband_act_scale is not None:
             key = ','.join(sorted(layers_dict.keys()))
             self.hiband_act_scales[key] = hiband_act_scale.detach().cpu()
