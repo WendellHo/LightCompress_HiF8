@@ -602,58 +602,22 @@ class HTG(BaseBlockwiseQuantization):
     @torch.no_grad()
     def _collect_hiband_histogram_stream(
         self,
-        stream_stats,
+        _stream_stats,
         z_g: List[torch.Tensor],
         step_to_group: Dict[int, int],
         input_name: str,
         num_steps: int,
         scale: torch.Tensor,
     ):
-        if self._current_block is None:
-            raise ValueError('HTG stream_stats HiBand requires current block context.')
-
-        stream_state = {'idx': 0}
-        scale_cpu = scale.detach().to(torch.float32).cpu()
-        hist_state = [None]
-
-        def collect_hiband_histogram_hook(_, x, _output):
-            step_idx = stream_state['idx'] % num_steps
-            stream_state['idx'] += 1
-            if len(x) == 0 or not torch.is_tensor(x[0]):
-                return
-
-            inp = x[0].detach()
-            if len(inp.shape) == 2:
-                inp = inp.unsqueeze(0)
-
-            group_idx = step_to_group[step_idx]
-            shift = z_g[group_idx].to(device=inp.device, dtype=inp.dtype)
-            shape = [1] * (inp.dim() - 1) + [-1]
-            post = (inp - shift.view(*shape)) / scale_cpu.to(device=inp.device, dtype=inp.dtype).view(*shape)
-            post = post.view(-1, post.shape[-1]).to(torch.float32).cpu()
-
-            if hist_state[0] is None:
-                hist_state[0] = self._init_hiband_histogram_state(
-                    post.shape[-1], device='cpu'
-                )
-            chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
-            for start in range(0, post.shape[0], chunk_size):
-                chunk = post[start:start + chunk_size]
-                self._incremental_update_hiband_histogram(hist_state[0], chunk)
-            del post
-
-        layer = dict(self._current_block.named_modules())[input_name]
-        handle = layer.register_forward_hook(collect_hiband_histogram_hook)
-        try:
-            self.block_forward(self._current_block, collect_output=False)
-        finally:
-            handle.remove()
-
-        if hist_state[0] is None:
-            return None
-        result = self._finalize_hiband_histogram_state(hist_state[0])
-        if result[5] == 0:
-            return None
+        result, _ = self._collect_hiband_histograms_stream(
+            z_g,
+            step_to_group,
+            input_name,
+            num_steps,
+            scale,
+            collect_global=True,
+            collect_grouped=False,
+        )
         return result
 
     @torch.no_grad()
@@ -706,7 +670,7 @@ class HTG(BaseBlockwiseQuantization):
     @torch.no_grad()
     def _collect_hiband_group_histograms_stream(
         self,
-        stream_stats,
+        _stream_stats,
         z_g: List[torch.Tensor],
         step_to_group: Dict[int, int],
         input_name: str,
@@ -714,57 +678,17 @@ class HTG(BaseBlockwiseQuantization):
         scale: torch.Tensor,
         group_num: int,
     ):
-        if self._current_block is None:
-            raise ValueError('HTG stream_stats HiBand requires current block context.')
-
-        stream_state = {'idx': 0}
-        scale_cpu = scale.detach().to(torch.float32).cpu()
-        hist_states = [None for _ in range(group_num)]
-
-        def collect_hiband_group_histogram_hook(_, x, _output):
-            step_idx = stream_state['idx'] % num_steps
-            stream_state['idx'] += 1
-            if len(x) == 0 or not torch.is_tensor(x[0]):
-                return
-
-            inp = x[0].detach()
-            if len(inp.shape) == 2:
-                inp = inp.unsqueeze(0)
-
-            group_idx = step_to_group[step_idx]
-            shift = z_g[group_idx].to(device=inp.device, dtype=inp.dtype)
-            shape = [1] * (inp.dim() - 1) + [-1]
-            post = (inp - shift.view(*shape)) / scale_cpu.to(device=inp.device, dtype=inp.dtype).view(*shape)
-            post = post.view(-1, post.shape[-1]).to(torch.float32).cpu()
-
-            if hist_states[group_idx] is None:
-                hist_states[group_idx] = self._init_hiband_histogram_state(
-                    post.shape[-1], device='cpu'
-                )
-            chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
-            for start in range(0, post.shape[0], chunk_size):
-                chunk = post[start:start + chunk_size]
-                self._incremental_update_hiband_histogram(hist_states[group_idx], chunk)
-            del post
-
-        layer = dict(self._current_block.named_modules())[input_name]
-        handle = layer.register_forward_hook(collect_hiband_group_histogram_hook)
-        try:
-            self.block_forward(self._current_block, collect_output=False)
-        finally:
-            handle.remove()
-
-        results = []
-        for state in hist_states:
-            if state is None:
-                results.append(None)
-            else:
-                result = self._finalize_hiband_histogram_state(state)
-                if result[5] == 0:
-                    results.append(None)
-                else:
-                    results.append(result)
-        return results
+        _, grouped_results = self._collect_hiband_histograms_stream(
+            z_g,
+            step_to_group,
+            input_name,
+            num_steps,
+            scale,
+            group_num=group_num,
+            collect_global=False,
+            collect_grouped=True,
+        )
+        return grouped_results
 
     @torch.no_grad()
     def _collect_hiband_act_samples(self, tensors, num_steps, step_to_group, z_g, scale):
@@ -1110,47 +1034,32 @@ class HTG(BaseBlockwiseQuantization):
     @torch.no_grad()
     def _compute_ema_scale_stream(
         self,
+        stream_stats,
         z_g: List[torch.Tensor],
         step_to_group: Dict[int, int],
-        input_name: str,
         num_steps: int,
     ):
-        if self._current_block is None:
-            raise ValueError('HTG stream_stats requires current block context.')
-        x_abs_max = [None for _ in range(num_steps)]
-        stream_state = {'idx': 0}
-
-        def collect_step_absmax(_, x, _output):
-            if len(x) == 0 or not torch.is_tensor(x[0]):
-                return
-            inp = x[0].detach()
-            if len(inp.shape) == 2:
-                inp = inp.unsqueeze(0)
-            step_idx = stream_state['idx'] % num_steps
-            group_idx = step_to_group[step_idx]
-            shift = z_g[group_idx].to(device=inp.device, dtype=inp.dtype)
-            shape = [1] * (inp.dim() - 1) + [-1]
-            shifted = inp - shift.view(*shape)
-            step_max = shifted.abs().view(-1, shifted.shape[-1]).amax(dim=0).to(torch.float32).cpu()
-            if x_abs_max[step_idx] is None:
-                x_abs_max[step_idx] = step_max
-            else:
-                x_abs_max[step_idx] = torch.maximum(x_abs_max[step_idx], step_max)
-            stream_state['idx'] += 1
-
-        layer = dict(self._current_block.named_modules())[input_name]
-        handle = layer.register_forward_hook(collect_step_absmax)
-        try:
-            # Stream second pass only needs hooks for statistics, no block outputs.
-            self.block_forward(self._current_block, collect_output=False)
-        finally:
-            handle.remove()
-
+        step_xmax = stream_stats.get('step_xmax', [])
+        step_xmin = stream_stats.get('step_xmin', [])
+        shift_counts = stream_stats.get('step_shift_count', [])
+        if len(step_xmax) == 0 or len(step_xmin) == 0:
+            raise ValueError('HTG stream_stats enabled but timestep extrema are empty.')
         x_abs_max_t = []
         for step_idx in range(num_steps):
-            if x_abs_max[step_idx] is None:
+            if step_idx >= len(step_xmax) or step_idx >= len(step_xmin):
                 raise ValueError('HTG stream_stats second pass encountered empty timestep data.')
-            x_abs_max_t.append(x_abs_max[step_idx].clamp(min=1e-5))
+            xmax = step_xmax[step_idx]
+            xmin = step_xmin[step_idx]
+            count = shift_counts[step_idx] if step_idx < len(shift_counts) else 0
+            if xmax is None or xmin is None or count <= 0:
+                raise ValueError('HTG stream_stats encountered empty timestep statistics.')
+            group_idx = step_to_group[step_idx]
+            shift = z_g[group_idx].to(dtype=torch.float32, device=xmax.device)
+            step_max = torch.maximum(
+                (xmax.to(torch.float32) - shift).abs(),
+                (xmin.to(torch.float32) - shift).abs(),
+            )
+            x_abs_max_t.append(step_max.clamp(min=1e-5))
 
         ema = None
         for t in range(len(x_abs_max_t) - 1, -1, -1):
@@ -1161,6 +1070,90 @@ class HTG(BaseBlockwiseQuantization):
         scale = ema / ema.max().clamp(min=1e-5)
         scale = scale.clamp(min=1e-5)
         return scale
+
+    @torch.no_grad()
+    def _collect_hiband_histograms_stream(
+        self,
+        z_g: List[torch.Tensor],
+        step_to_group: Dict[int, int],
+        input_name: str,
+        num_steps: int,
+        scale: torch.Tensor,
+        group_num: int = 0,
+        collect_global: bool = True,
+        collect_grouped: bool = False,
+    ):
+        if self._current_block is None:
+            raise ValueError('HTG stream_stats HiBand requires current block context.')
+
+        stream_state = {'idx': 0}
+        scale_cpu = scale.detach().to(torch.float32).cpu()
+        global_hist_state = [None] if collect_global else None
+        group_hist_states = [None for _ in range(group_num)] if collect_grouped else None
+        chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
+
+        def collect_hiband_histogram_hook(_, x, _output):
+            step_idx = stream_state['idx'] % num_steps
+            stream_state['idx'] += 1
+            if len(x) == 0 or not torch.is_tensor(x[0]):
+                return
+
+            inp = x[0].detach()
+            if len(inp.shape) == 2:
+                inp = inp.unsqueeze(0)
+
+            group_idx = step_to_group[step_idx]
+            shift = z_g[group_idx].to(device=inp.device, dtype=inp.dtype)
+            shape = [1] * (inp.dim() - 1) + [-1]
+            post = (inp - shift.view(*shape)) / scale_cpu.to(
+                device=inp.device, dtype=inp.dtype
+            ).view(*shape)
+            post = post.view(-1, post.shape[-1]).to(torch.float32).cpu()
+
+            if collect_global and global_hist_state[0] is None:
+                global_hist_state[0] = self._init_hiband_histogram_state(
+                    post.shape[-1], device='cpu'
+                )
+            if collect_grouped and group_hist_states[group_idx] is None:
+                group_hist_states[group_idx] = self._init_hiband_histogram_state(
+                    post.shape[-1], device='cpu'
+                )
+
+            for start in range(0, post.shape[0], chunk_size):
+                chunk = post[start:start + chunk_size]
+                if collect_global:
+                    self._incremental_update_hiband_histogram(global_hist_state[0], chunk)
+                if collect_grouped:
+                    self._incremental_update_hiband_histogram(group_hist_states[group_idx], chunk)
+            del post
+
+        layer = dict(self._current_block.named_modules())[input_name]
+        handle = layer.register_forward_hook(collect_hiband_histogram_hook)
+        try:
+            self.block_forward(self._current_block, collect_output=False)
+        finally:
+            handle.remove()
+
+        global_result = None
+        if collect_global and global_hist_state[0] is not None:
+            result = self._finalize_hiband_histogram_state(global_hist_state[0])
+            if result[5] != 0:
+                global_result = result
+
+        grouped_results = None
+        if collect_grouped:
+            grouped_results = []
+            for state in group_hist_states:
+                if state is None:
+                    grouped_results.append(None)
+                    continue
+                result = self._finalize_hiband_histogram_state(state)
+                if result[5] == 0:
+                    grouped_results.append(None)
+                else:
+                    grouped_results.append(result)
+
+        return global_result, grouped_results
 
     @torch.no_grad()
     def _collect_hiband_act_samples_stream(
@@ -1702,7 +1695,7 @@ class HTG(BaseBlockwiseQuantization):
         z_g = self._compute_group_shifts(z_t, groups)
 
         if self.stream_stats and isinstance(tensors, dict):
-            scale = self._compute_ema_scale_stream(z_g, step_to_group, input_name, num_steps)
+            scale = self._compute_ema_scale_stream(tensors, z_g, step_to_group, num_steps)
         else:
             scale = self._compute_ema_scale(step_buckets, z_g, step_to_group)
 
@@ -1711,6 +1704,10 @@ class HTG(BaseBlockwiseQuantization):
             hiband_act_scale = None
             hiband_group_act_scales = None
             if self.hiband_enabled:
+                need_group_histograms = (
+                    self.hiband_runtime_group_act_scale_enabled
+                    and self.hiband_group_source == 'htg'
+                )
                 if self.hiband_use_true_qdq_mse:
                     if self.stream_stats and isinstance(tensors, dict):
                         act_samples = self._collect_hiband_act_samples_stream(
@@ -1724,9 +1721,17 @@ class HTG(BaseBlockwiseQuantization):
                         act_samples, scale.device, scale.dtype, side='act'
                     )
                 else:
+                    grouped_histograms = None
                     if self.stream_stats and isinstance(tensors, dict):
-                        hist_result = self._collect_hiband_histogram_stream(
-                            tensors, z_g, step_to_group, input_name, num_steps, scale
+                        hist_result, grouped_histograms = self._collect_hiband_histograms_stream(
+                            z_g,
+                            step_to_group,
+                            input_name,
+                            num_steps,
+                            scale,
+                            group_num=group_num,
+                            collect_global=True,
+                            collect_grouped=need_group_histograms,
                         )
                     else:
                         hist_result = self._collect_hiband_histogram(
@@ -1741,8 +1746,7 @@ class HTG(BaseBlockwiseQuantization):
                 if hiband_act_scale is not None:
                     self._attach_hiband_act_scale(layers, hiband_act_scale)
                 if (
-                    self.hiband_runtime_group_act_scale_enabled
-                    and self.hiband_group_source == 'htg'
+                    need_group_histograms
                     and hiband_act_scale is not None
                 ):
                     if self.hiband_use_true_qdq_mse:
@@ -1758,11 +1762,7 @@ class HTG(BaseBlockwiseQuantization):
                             grouped_act_samples, hiband_act_scale, scale.device, scale.dtype
                         )
                     else:
-                        if self.stream_stats and isinstance(tensors, dict):
-                            grouped_histograms = self._collect_hiband_group_histograms_stream(
-                                tensors, z_g, step_to_group, input_name, num_steps, scale, group_num
-                            )
-                        else:
+                        if not (self.stream_stats and isinstance(tensors, dict)):
                             grouped_histograms = self._collect_hiband_group_histograms(
                                 tensors, num_steps, step_to_group, z_g, scale, group_num
                             )
@@ -1815,6 +1815,10 @@ class HTG(BaseBlockwiseQuantization):
         hiband_group_act_scales = None
         hiband_weight_scales = {}
         if self.hiband_enabled:
+            need_group_histograms = (
+                self.hiband_runtime_group_act_scale_enabled
+                and self.hiband_group_source == 'htg'
+            )
             needs_act_samples = (
                 self.hiband_use_true_qdq_mse
                 or self.hiband_weight_scale_enabled
@@ -1833,9 +1837,17 @@ class HTG(BaseBlockwiseQuantization):
                 )
             else:
                 act_samples = None
+                grouped_histograms = None
                 if self.stream_stats and isinstance(tensors, dict):
-                    hist_result = self._collect_hiband_histogram_stream(
-                        tensors, z_g, step_to_group, input_name, num_steps, scale
+                    hist_result, grouped_histograms = self._collect_hiband_histograms_stream(
+                        z_g,
+                        step_to_group,
+                        input_name,
+                        num_steps,
+                        scale,
+                        group_num=group_num,
+                        collect_global=True,
+                        collect_grouped=need_group_histograms,
                     )
                 else:
                     hist_result = self._collect_hiband_histogram(
@@ -1859,8 +1871,7 @@ class HTG(BaseBlockwiseQuantization):
             if hiband_act_scale is not None:
                 self._attach_hiband_act_scale(layers, hiband_act_scale)
             if (
-                self.hiband_runtime_group_act_scale_enabled
-                and self.hiband_group_source == 'htg'
+                need_group_histograms
             ):
                 if self.hiband_use_true_qdq_mse:
                     if self.stream_stats and isinstance(tensors, dict):
@@ -1875,11 +1886,7 @@ class HTG(BaseBlockwiseQuantization):
                         grouped_act_samples, hiband_act_scale, scale.device, scale.dtype
                     )
                 else:
-                    if self.stream_stats and isinstance(tensors, dict):
-                        grouped_histograms = self._collect_hiband_group_histograms_stream(
-                            tensors, z_g, step_to_group, input_name, num_steps, scale, group_num
-                        )
-                    else:
+                    if not (self.stream_stats and isinstance(tensors, dict)):
                         grouped_histograms = self._collect_hiband_group_histograms(
                             tensors, num_steps, step_to_group, z_g, scale, group_num
                         )

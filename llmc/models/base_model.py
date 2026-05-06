@@ -119,7 +119,7 @@ class BaseModel(metaclass=ABCMeta):
         pass
 
     def build_tokenizer(self):
-        if self.model_type not in ['Vit', 'WanT2V', 'WanI2V', 'Wan2T2V']:
+        if self.model_type not in ['Vit', 'ResNet', 'WanT2V', 'WanI2V', 'Wan2T2V']:
             assert self.tokenizer_mode in ['fast', 'slow']
             self.tokenizer = AutoTokenizer.from_pretrained(
                 self.model_path, use_fast=self.tokenizer_mode, trust_remote_code=True
@@ -129,7 +129,7 @@ class BaseModel(metaclass=ABCMeta):
             if self.tokenizer.pad_token is None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
         else:
-            self.tokenizer = None 
+            self.tokenizer = None
 
     def get_tokenizer(self):
         return self.tokenizer
@@ -198,6 +198,14 @@ class BaseModel(metaclass=ABCMeta):
                 first_block_input['kwargs'].append(kwargs)
                 raise ValueError
         return Catcher
+
+    def replace_first_block_with_catcher(self, catcher_module):
+        original_module = self.blocks[0]
+        self.blocks[0] = catcher_module
+        return original_module
+
+    def restore_first_block_from_catcher(self, original_module):
+        self.blocks[0] = original_module
 
     def __str__(self):
         return f'\nConfig: \n{str(self.model_config)} \nModel: \n{str(self.model)}'
@@ -301,7 +309,9 @@ class BaseModel(metaclass=ABCMeta):
             if self.audio_projector:
                 self.audio_projector.cuda()
             self.blocks[0] = self.blocks[0].cuda()
-        self.blocks[0] = Catcher(self.blocks[0])
+        original_first_block = self.replace_first_block_with_catcher(
+            Catcher(self.blocks[0])
+        )
 
         for data in calib_data:
             data = {
@@ -341,7 +351,8 @@ class BaseModel(metaclass=ABCMeta):
                 self.audio_projector.cpu()
             self.blocks[0] = self.blocks[0].cpu()
             self.move_embed_to_device('cpu')
-        self.blocks[0] = self.blocks[0].module
+        restored_block = getattr(self.blocks[0], 'module', original_first_block)
+        self.restore_first_block_from_catcher(restored_block)
 
     def get_one_pad_setting(self, padding_side, length):
         if padding_side == 'left':

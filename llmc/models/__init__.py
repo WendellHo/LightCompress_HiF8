@@ -29,6 +29,7 @@ from .qwen2moe import Qwen2Moe
 from .qwen2vl import Qwen2VL
 from .qwen3 import Qwen3
 from .qwen3moe import Qwen3Moe
+from .resnet import ResNet
 from .smollm import SmolLM
 from .stablelm import StableLm
 from .starcoder import Starcoder

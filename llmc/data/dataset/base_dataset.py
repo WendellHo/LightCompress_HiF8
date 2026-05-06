@@ -1,12 +1,11 @@
 import json
 import os
+import random
 from abc import ABCMeta
 
 import torch
 from datasets import load_dataset, load_from_disk
 from loguru import logger
-from PIL import Image
-from torch.nn import functional as F
 
 from .specified_preproc import PREPROC_REGISTRY
 
@@ -82,6 +81,7 @@ class BaseDataset(metaclass=ABCMeta):
                 'custom_txt',
                 'custom_mm',
                 'images',
+                'imagenet',
                 't2v',
                 'i2v',
             ]:
@@ -93,7 +93,7 @@ class BaseDataset(metaclass=ABCMeta):
         if not self.padding:
             if self.calib_dataset_name in ['t2v', 'i2v']:
                 calib_model_inputs = samples
-            elif self.calib_dataset_name == 'images':
+            elif self.calib_dataset_name in ['images', 'imagenet']:
                 calib_model_inputs = self.get_batch_process(samples)
             else:
                 assert not self.calib_dataset_name == 'custom_mm'
@@ -175,6 +175,14 @@ class BaseDataset(metaclass=ABCMeta):
         samples = self.calib_dataset[
             int(os.environ['RANK'])::int(os.environ['WORLD_SIZE'])
         ]
+        if (
+            self.n_samples is not None
+            and self.calib_dataset_name in ['images', 'imagenet']
+            and len(samples) > self.n_samples
+        ):
+            rng = random.Random(self.seed)
+            picked = sorted(rng.sample(range(len(samples)), self.n_samples))
+            samples = [samples[idx] for idx in picked]
         logger.info(f'len(samples) rank : {len(samples)}')
 
         calib_model_inputs = self.get_calib_model_inputs(samples)
@@ -190,6 +198,10 @@ class BaseDataset(metaclass=ABCMeta):
 
     def get_custom_dataset(self, custom_dataset_path):
         audio_img_qa_json = os.path.join(custom_dataset_path, 'samples.json')
+        if self.calib_dataset_name in ['images', 'imagenet'] and not os.path.exists(
+            audio_img_qa_json
+        ):
+            return self.get_image_dataset(custom_dataset_path)
         fp = open(audio_img_qa_json)
         custom_data_samples = json.load(fp)
         for idx in range(len(custom_data_samples)):
@@ -225,4 +237,23 @@ class BaseDataset(metaclass=ABCMeta):
                 custom_data_samples[idx]['prompt'] = ''
             if 'negative_prompt' not in custom_data_samples[idx]:
                 custom_data_samples[idx]['negative_prompt'] = ''
+        return custom_data_samples
+
+    def get_image_dataset(self, custom_dataset_path):
+        image_exts = {'.jpg', '.jpeg', '.png', '.bmp', '.webp'}
+        custom_data_samples = []
+        for root, _, files in os.walk(custom_dataset_path):
+            for file_name in sorted(files):
+                if os.path.splitext(file_name)[1].lower() not in image_exts:
+                    continue
+                custom_data_samples.append(
+                    {
+                        'image': os.path.join(root, file_name),
+                        'audio': None,
+                        'question': '',
+                        'answer': '',
+                        'prompt': '',
+                        'negative_prompt': '',
+                    }
+                )
         return custom_data_samples

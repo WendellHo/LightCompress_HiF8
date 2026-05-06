@@ -688,6 +688,29 @@ class LlmcMiniCPMRMSNorm(LlmcLlamaRMSNorm):
         return 'LlmcMiniCPMRMSNorm()'
 
 
+def _is_conv2d_module(module):
+    return isinstance(module, nn.Conv2d) or getattr(module, 'module_kind', None) == 'conv2d'
+
+
+def _set_module_io_meta(new_module, module):
+    if _is_conv2d_module(module):
+        new_module.module_kind = 'conv2d'
+        new_module.in_channels = module.in_channels
+        new_module.out_channels = module.out_channels
+        new_module.in_features = module.in_channels
+        new_module.out_features = module.out_channels
+        new_module.kernel_size = module.kernel_size
+        new_module.stride = module.stride
+        new_module.padding = module.padding
+        new_module.dilation = module.dilation
+        new_module.groups = module.groups
+    else:
+        new_module.module_kind = 'linear'
+        new_module.in_features = module.in_features
+        new_module.out_features = module.out_features
+    return new_module
+
+
 class OriginFloatLinear(nn.Module):
     def __init__(self, weight, bias, ori_module):
         super().__init__()
@@ -705,6 +728,16 @@ class OriginFloatLinear(nn.Module):
         else:
             self.buf_rotate = False
 
+        self.module_kind = 'conv2d' if _is_conv2d_module(ori_module) else 'linear'
+        if self.module_kind == 'conv2d':
+            self.in_channels = ori_module.in_channels
+            self.out_channels = ori_module.out_channels
+            self.kernel_size = ori_module.kernel_size
+            self.stride = ori_module.stride
+            self.padding = ori_module.padding
+            self.dilation = ori_module.dilation
+            self.groups = ori_module.groups
+
         if self.weight.data.dtype == torch.float8_e4m3fn:
             self.fp8_forward = True
             self.weight_scale_inv = ori_module.weight_scale_inv
@@ -716,7 +749,17 @@ class OriginFloatLinear(nn.Module):
     def forward(self, x):
         if hasattr(self, 'buf_rotate') and self.buf_rotate:
             x = self.rotater.rotate(x)
-        if self.fp8_forward:
+        if self.module_kind == 'conv2d':
+            y = F.conv2d(
+                x,
+                self.weight,
+                self.bias,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        elif self.fp8_forward:
             y = block_wise_fp8_forward_func(
                 x, self.weight, self.weight_scale_inv, self.block_size, self.bias
             )
@@ -727,7 +770,7 @@ class OriginFloatLinear(nn.Module):
     @classmethod
     @torch.no_grad()
     def new(cls, module):
-        if isinstance(module, nn.Linear):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
             return module
 
         weight = module.weight.data
@@ -737,14 +780,12 @@ class OriginFloatLinear(nn.Module):
             bias = None
 
         new_module = cls(weight, bias, module)
-
-        new_module.in_features = module.in_features
-        new_module.out_features = module.out_features
-        return new_module
+        return _set_module_io_meta(new_module, module)
 
     def __repr__(self):
         return (
-            f'OriginFloatLinear(in_features={self.in_features},'
+            f'OriginFloatLinear(module_kind={self.module_kind},'
+            f'in_features={self.in_features},'
             f'out_features={self.out_features},'
             f'online_rotate={self.buf_rotate},'
             f'fp8_forward={self.fp8_forward},'
@@ -901,6 +942,16 @@ class FakeQuantLinear(nn.Module):
         else:
             self.buf_rotate = False
 
+        self.module_kind = 'conv2d' if _is_conv2d_module(ori_module) else 'linear'
+        if self.module_kind == 'conv2d':
+            self.in_channels = ori_module.in_channels
+            self.out_channels = ori_module.out_channels
+            self.kernel_size = ori_module.kernel_size
+            self.stride = ori_module.stride
+            self.padding = ori_module.padding
+            self.dilation = ori_module.dilation
+            self.groups = ori_module.groups
+
         if self.weight.data.dtype == torch.float8_e4m3fn:
             self.fp8_forward = True
             self.weight_scale_inv = ori_module.weight_scale_inv
@@ -930,7 +981,17 @@ class FakeQuantLinear(nn.Module):
         elif self.dynamic_quant_tmp_weight:
             self.tmp_weight = self.w_qdq(self)
 
-        if self.fp8_forward:
+        if self.module_kind == 'conv2d':
+            y = F.conv2d(
+                x,
+                self.tmp_weight,
+                self.tmp_bias,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        elif self.fp8_forward:
             y = block_wise_fp8_forward_func(
                 x, self.weight, self.weight_scale_inv, self.block_size, self.bias
             )
@@ -948,9 +1009,7 @@ class FakeQuantLinear(nn.Module):
             bias = None
 
         new_module = cls(weight, bias, ori_module=module, w_qdq=w_qdq, a_qdq=a_qdq)
-
-        new_module.in_features = module.in_features
-        new_module.out_features = module.out_features
+        new_module = _set_module_io_meta(new_module, module)
         new_module.w_qdq_name = cls.get_func_name(w_qdq)
         new_module.a_qdq_name = (
             cls.get_func_name(a_qdq) if a_qdq is not None else 'None'
@@ -965,7 +1024,8 @@ class FakeQuantLinear(nn.Module):
 
     def __repr__(self):
         return (
-            f'FakeQuantLinear(in_features={self.in_features},'
+            f'FakeQuantLinear(module_kind={self.module_kind},'
+            f'in_features={self.in_features},'
             f'out_features={self.out_features}, bias={self.bias is not None},'
             f'weight_quant={self.w_qdq_name},'
             f'act_quant={self.a_qdq_name},'
@@ -991,6 +1051,16 @@ class EffcientFakeQuantLinear(nn.Module):
         else:
             self.buf_rotate = False
 
+        self.module_kind = 'conv2d' if _is_conv2d_module(ori_module) else 'linear'
+        if self.module_kind == 'conv2d':
+            self.in_channels = ori_module.in_channels
+            self.out_channels = ori_module.out_channels
+            self.kernel_size = ori_module.kernel_size
+            self.stride = ori_module.stride
+            self.padding = ori_module.padding
+            self.dilation = ori_module.dilation
+            self.groups = ori_module.groups
+
         if self.weight.data.dtype == torch.float8_e4m3fn:
             self.fp8_forward = True
             self.weight_scale_inv = ori_module.weight_scale_inv
@@ -1006,7 +1076,17 @@ class EffcientFakeQuantLinear(nn.Module):
         if self.a_qdq is not None:
             x = self.a_qdq(x, self)
 
-        if self.fp8_forward:
+        if self.module_kind == 'conv2d':
+            y = F.conv2d(
+                x,
+                self.weight,
+                self.bias,
+                stride=self.stride,
+                padding=self.padding,
+                dilation=self.dilation,
+                groups=self.groups,
+            )
+        elif self.fp8_forward:
             y = block_wise_fp8_forward_func(
                 x, self.weight, self.weight_scale_inv, self.block_size, self.bias
             )
@@ -1025,9 +1105,7 @@ class EffcientFakeQuantLinear(nn.Module):
             bias = None
 
         new_module = cls(weight, bias, ori_module=module, a_qdq=a_qdq)
-
-        new_module.in_features = module.in_features
-        new_module.out_features = module.out_features
+        new_module = _set_module_io_meta(new_module, module)
         new_module.w_qdq_name = cls.get_func_name(w_qdq)
         new_module.a_qdq_name = (
             cls.get_func_name(a_qdq) if a_qdq is not None else 'None'
@@ -1043,7 +1121,8 @@ class EffcientFakeQuantLinear(nn.Module):
 
     def __repr__(self):
         return (
-            f'EffcientFakeQuantLinear(in_features={self.in_features},'
+            f'EffcientFakeQuantLinear(module_kind={self.module_kind},'
+            f'in_features={self.in_features},'
             f'out_features={self.out_features},'
             f'bias={self.bias is not None},'
             f'weight_quant={self.w_qdq_name},'
@@ -1567,7 +1646,7 @@ class MlcllmRealQuantLinear(AutoawqRealQuantLinear):
 
 
 _TRANSFORMERS_LN_TYPES_ = ALL_LAYERNORM_LAYERS
-_TRANSFORMERS_LINEAR_TYPES_ = [nn.Linear]
+_TRANSFORMERS_LINEAR_TYPES_ = [nn.Linear, nn.Conv2d]
 
 _MODEL_LN_TYPES_PAIRS_ = {
     'Llama': LlmcLlamaRMSNorm,

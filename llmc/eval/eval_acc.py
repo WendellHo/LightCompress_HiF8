@@ -3,7 +3,6 @@ import gc
 import torch
 from loguru import logger
 from torch.utils.data import DataLoader
-from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 
@@ -16,11 +15,7 @@ class AccuracyEval:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     def load_imagenet(self):
-        val_transform = transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-        ])
-        val_dataset = ImageFolder(root=self.imagenet_root, transform=val_transform)
+        val_dataset = ImageFolder(root=self.imagenet_root, transform=None)
         val_loader = DataLoader(
             val_dataset,
             batch_size=self.bs,

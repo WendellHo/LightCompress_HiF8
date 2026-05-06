@@ -48,6 +48,83 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         super().__init__(model, quant_config, input, padding_mask, config)
         self.set_quant_config()
 
+    def _is_conv_module(self, module):
+        return isinstance(module, nn.Conv2d) or getattr(module, 'module_kind', None) == 'conv2d'
+
+    def _prepare_weight_for_quant(self, module, weight):
+        if self._is_conv_module(module):
+            org_shape = weight.shape
+            return weight.reshape(org_shape[0], -1), org_shape
+        return weight, weight.shape
+
+    def _restore_weight_from_quant(self, module, weight, org_shape):
+        if self._is_conv_module(module):
+            return weight.reshape(org_shape)
+        return weight
+
+    def _prepare_act_for_quant(self, module, act):
+        if not self._is_conv_module(module) or act.dim() < 2:
+            return act, None
+
+        permute_dims = [idx for idx in range(act.dim()) if idx != 1] + [1]
+        inv_permute_dims = [0] * len(permute_dims)
+        for idx, dim in enumerate(permute_dims):
+            inv_permute_dims[dim] = idx
+
+        permuted_shape = tuple(act.shape[dim] for dim in permute_dims)
+        act = act.permute(*permute_dims).contiguous().view(-1, act.shape[1])
+        meta = {
+            'permuted_shape': permuted_shape,
+            'inv_permute_dims': inv_permute_dims,
+        }
+        return act, meta
+
+    def _restore_act_from_quant(self, act, meta):
+        if meta is None:
+            return act
+        act = act.view(*meta['permuted_shape'])
+        return act.permute(*meta['inv_permute_dims']).contiguous()
+
+    def _get_hiband_input_channels(self, layer):
+        if not hasattr(layer, 'weight'):
+            return None
+        if self._is_conv_module(layer):
+            return layer.weight.shape[1]
+        return layer.weight.shape[-1]
+
+    def _hiband_scale_matches_layer(self, layer, hiband_scale):
+        channel_num = self._get_hiband_input_channels(layer)
+        return channel_num is not None and channel_num == hiband_scale.numel()
+
+    def _view_hiband_weight_scale(self, layer, scale, dtype=torch.float32):
+        scale = scale.to(device=layer.weight.device, dtype=dtype)
+        if self._is_conv_module(layer):
+            return scale.view(1, -1, 1, 1)
+        return scale.view(1, -1)
+
+    def _get_hiband_post_weight(self, layer, base_scale):
+        if not hasattr(layer, 'weight') or not self._hiband_scale_matches_layer(
+            layer, base_scale
+        ):
+            return None
+        weight = layer.weight.detach().to(torch.float32)
+        scale_view = self._view_hiband_weight_scale(layer, base_scale)
+        return weight * scale_view
+
+    def _get_hiband_weight_channel_max(self, layer, post_weight):
+        if self._is_conv_module(layer):
+            return post_weight.abs().amax(dim=(0, 2, 3))
+        return post_weight.abs().amax(dim=0)
+
+    def _get_hiband_weight_score_terms(self, layer, qdq_weight, post_weight):
+        if self._is_conv_module(layer):
+            cand_norm = qdq_weight.pow(2).sum(dim=(0, 2, 3))
+            cand_dot = (qdq_weight * post_weight).sum(dim=(0, 2, 3))
+        else:
+            cand_norm = qdq_weight.pow(2).sum(dim=0)
+            cand_dot = (qdq_weight * post_weight).sum(dim=0)
+        return cand_norm, cand_dot
+
     def w_qdq(self, module, wquantizer):
         args = {'lowbound_factor': None, 'upbound_factor': None}
         if hasattr(module, 'buf_lowbound_factor'):
@@ -63,7 +140,9 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         else:
             tmp_weight = module.weight
 
+        tmp_weight, org_shape = self._prepare_weight_for_quant(module, tmp_weight)
         tmp_weight = wquantizer.fake_quant_weight_dynamic(tmp_weight, args)
+        tmp_weight = self._restore_weight_from_quant(module, tmp_weight, org_shape)
 
         if module.weight.data.dtype == torch.float8_e4m3fn:
             tmp_weight, module.weight_scale_inv.data \
@@ -72,7 +151,10 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         return tmp_weight
 
     def w_q(self, module, wquantizer):
-        return wquantizer.real_quant_weight_dynamic(module.weight.data)
+        weight, org_shape = self._prepare_weight_for_quant(module, module.weight.data)
+        q_weight, scales, zeros = wquantizer.real_quant_weight_dynamic(weight)
+        q_weight = self._restore_weight_from_quant(module, q_weight, org_shape)
+        return q_weight, scales, zeros
 
     def _get_hiband_fake_quant_scale(self, act, module, aquantizer):
         quant_type = str(getattr(aquantizer, 'quant_type', '')).lower()
@@ -82,17 +164,27 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
         hiband_scale = getattr(module, 'hiband_act_scale', None)
         if not torch.is_tensor(hiband_scale):
             return None
-        if act.dim() == 0 or hiband_scale.numel() != act.shape[-1]:
+        if act.dim() == 0:
             return None
 
-        view_shape = [1] * act.dim()
-        view_shape[-1] = hiband_scale.numel()
+        if isinstance(module, nn.Conv2d) or getattr(module, 'module_kind', None) == 'conv2d':
+            if act.dim() < 2 or hiband_scale.numel() != act.shape[1]:
+                return None
+            view_shape = [1] * act.dim()
+            view_shape[1] = hiband_scale.numel()
+        else:
+            if hiband_scale.numel() != act.shape[-1]:
+                return None
+            view_shape = [1] * act.dim()
+            view_shape[-1] = hiband_scale.numel()
         return hiband_scale.to(device=act.device, dtype=act.dtype).view(*view_shape)
 
     def a_qdq(self, act, module, aquantizer, input_index=0):
         hiband_scale = self._get_hiband_fake_quant_scale(act, module, aquantizer)
         if hiband_scale is not None:
             act = act / hiband_scale
+
+        act, act_meta = self._prepare_act_for_quant(module, act)
 
         if self.act_static:
             args = {
@@ -104,6 +196,8 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             act = aquantizer.fake_quant_act_static(act, args)
         else:
             act = aquantizer.fake_quant_act_dynamic(act)
+
+        act = self._restore_act_from_quant(act, act_meta)
 
         if hiband_scale is not None:
             act = act * hiband_scale
@@ -306,7 +400,13 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             ), 'Please set online_rotate=False'
             self.fp32_had = special_config.get('fp32_had', False)
         if self.quant_config.modality != 'video_gen':
-            self.set_model_config()
+            if (
+                hasattr(self.model.model_config, 'hidden_size')
+                and hasattr(self.model.model_config, 'num_attention_heads')
+            ):
+                self.set_model_config()
+            else:
+                self.has_gqa = False
         self.modality = self.quant_config.modality
         logger.info(f'self.quant_objects : {self.quant_config.modality}')
 
@@ -403,6 +503,8 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
                                                       self.fp8_block_size).to(torch.bfloat16)
             else:
                 tmp_weight_data = m.weight.data
+
+            tmp_weight_data, _ = self._prepare_weight_for_quant(m, tmp_weight_data)
 
             (
                 tensor,
@@ -656,6 +758,17 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
 
     @torch.no_grad()
     def register_act_qparams(self, layers_dict, act_tensors):
+        ref_layer = None
+        for layer in layers_dict.values():
+            if isinstance(layer, tuple(_LLMC_LINEAR_TYPES_ + _TRANSFORMERS_LINEAR_TYPES_)):
+                ref_layer = layer
+                break
+
+        if ref_layer is not None:
+            act_tensors = [
+                self._prepare_act_for_quant(ref_layer, tensor)[0] for tensor in act_tensors
+            ]
+
         scales_list, zeros_list, qmin_list, qmax_list = (
             self.aquantizer.get_batch_tensors_qparams(act_tensors)
         )
@@ -693,11 +806,22 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             prev_op[0], tuple(_LLMC_LINEAR_TYPES_ + _TRANSFORMERS_LINEAR_TYPES_)
         ):
             assert len(layers) == 1
-            logger.info('apply scale between fc and fc')
-            self.scale_fc_fc(prev_op[0], layers[0], scales)
+            if isinstance(prev_op[0], nn.Conv2d) or getattr(prev_op[0], 'module_kind', None) == 'conv2d':
+                logger.info('apply scale between conv and conv')
+                self.scale_conv_conv(prev_op[0], layers[0], scales)
+            else:
+                logger.info('apply scale between fc and fc')
+                self.scale_fc_fc(prev_op[0], layers[0], scales)
         elif isinstance(prev_op[0], tuple(_LLMC_LN_TYPES_ + _TRANSFORMERS_LN_TYPES_)):
-            logger.info('apply scale between ln and fc')
-            self.scale_ln_fcs(prev_op[0], layers, scales)
+            if any(
+                isinstance(fc, nn.Conv2d) or getattr(fc, 'module_kind', None) == 'conv2d'
+                for fc in layers
+            ):
+                logger.info('apply scale between norm and conv')
+                self.scale_ln_fcs(prev_op[0], layers, scales)
+            else:
+                logger.info('apply scale between ln and fc')
+                self.scale_ln_fcs(prev_op[0], layers, scales)
         else:
             raise NotImplementedError(f'prev_op {type(prev_op[0])} not supported yet!')
 
@@ -791,6 +915,20 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             fc2.weight.mul_(scales.view(1, -1))
 
     @torch.no_grad()
+    def scale_conv_conv(self, conv1, conv2, scales):
+        scales = scales.to(conv1.weight.device, dtype=conv1.weight.dtype)
+        out_channels = conv1.weight.shape[0]
+        in_channels = conv2.weight.shape[1]
+        if out_channels != scales.numel() or in_channels != scales.numel():
+            raise Exception('Can not scale this conv-conv.')
+
+        conv1.weight.div_(scales.view(-1, 1, 1, 1))
+        if hasattr(conv1, 'bias') and conv1.bias is not None:
+            conv1.bias.div_(scales.view(-1))
+
+        conv2.weight.mul_(scales.view(1, -1, 1, 1))
+
+    @torch.no_grad()
     def shift_fc_fc(self, fc1, fc2, shifts):
         if fc1.out_features == fc2.in_features * 3:
             num_heads = self.model.get_model_config().to_dict().get('n_head', None)
@@ -851,7 +989,9 @@ class BaseBlockwiseQuantization(BlockwiseOpt):
             ln.bias.div_(scales)
 
         for fc in fcs:
-            if fc.weight.data.dtype == torch.float8_e4m3fn:
+            if isinstance(fc, nn.Conv2d) or getattr(fc, 'module_kind', None) == 'conv2d':
+                fc.weight.mul_(scales.view(1, -1, 1, 1))
+            elif fc.weight.data.dtype == torch.float8_e4m3fn:
                 fp8_scale = fc.weight_scale_inv.data
                 tmp_weight_data = weight_cast_to_bf16(fc.weight.data,
                                                       fp8_scale,

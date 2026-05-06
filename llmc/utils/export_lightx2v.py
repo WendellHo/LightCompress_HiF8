@@ -41,6 +41,12 @@ def update_lightx2v_quant_config(save_quant_path, config=None, hif8_export_mode=
     if _has_hif8_quant(config):
         hiband_cfg = _get_hiband_special_cfg(config)
         hiband_enabled = bool(hiband_cfg.get('enabled', False))
+        hiband_act_scale_enabled = hiband_enabled and bool(
+            hiband_cfg.get('act_scale_enabled', True)
+        )
+        hiband_weight_scale_enabled = hiband_enabled and bool(
+            hiband_cfg.get('weight_scale_enabled', True)
+        )
         config_lightx2v['dit_quantized'] = True
         use_fake_bf16 = str(hif8_export_mode).lower() == 'fake_bf16'
         config_lightx2v['dit_quant_scheme'] = (
@@ -58,7 +64,7 @@ def update_lightx2v_quant_config(save_quant_path, config=None, hif8_export_mode=
             'enable_output_requant': False,
             'compute_dtype': 'bf16',
         }
-        if hiband_enabled:
+        if hiband_act_scale_enabled:
             hif8_runtime['hiband_enabled'] = True
             hif8_runtime['hiband_apply_mode'] = 'pre_qdq'
             hif8_runtime['hiband_runtime_group_act_scale_enabled'] = bool(
@@ -70,6 +76,10 @@ def update_lightx2v_quant_config(save_quant_path, config=None, hif8_export_mode=
             hif8_runtime['hiband_fallback_global_act_scale'] = bool(
                 hiband_cfg.get('export_global_act_scale', True)
             )
+        hif8_runtime['hiband_act_scale_enabled'] = hiband_act_scale_enabled
+        hif8_runtime['hiband_weight_scale_enabled'] = hiband_weight_scale_enabled
+        if not hiband_act_scale_enabled:
+            hif8_runtime['enable_input_qdq'] = False
         config_lightx2v['hif8_runtime'] = hif8_runtime
     with open(config_file, 'w') as file:
         json.dump(config_lightx2v, file, indent=4)

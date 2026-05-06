@@ -1,5 +1,6 @@
 import copy
 import os
+from datetime import datetime
 
 import torch.distributed as dist
 from loguru import logger
@@ -8,6 +9,24 @@ from llmc.eval import (AccuracyEval, CustomGenerate, CustomGenerateJustInfer,
                        DecodePerplexityEval, HumanEval, PerplexityEval,
                        TokenConsistencyEval, VideoGenerateEval, VQAEval)
 from llmc.utils import deploy_all_modality
+
+
+def _save_eval_result(config_for_eval, eval_pos, eval_name, dataset_name, res):
+    if 'save' not in config_for_eval or 'save_path' not in config_for_eval.save:
+        return
+
+    save_dir = config_for_eval.save.save_path
+    if not save_dir:
+        return
+
+    os.makedirs(save_dir, exist_ok=True)
+    result_path = os.path.join(save_dir, 'eval_results.txt')
+    timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(result_path, 'a', encoding='utf-8') as f:
+        f.write(
+            f'[{timestamp}] eval_pos={eval_pos} '
+            f'eval={eval_name} dataset={dataset_name} result={res}\n'
+        )
 
 
 def _is_distributed_video_gen_eval(eval_cfg):
@@ -113,6 +132,9 @@ def eval_model(model, blockwise_opts, eval_list, eval_pos):
                 eval_name = config_for_eval.eval.type
                 dataset_name = config_for_eval.eval.name
                 logger.info(f'EVAL: {eval_name} on {dataset_name} is {res}')
+                _save_eval_result(
+                    config_for_eval, eval_pos, eval_name, dataset_name, res
+                )
 
         if has_distributed_video_eval and dist.is_available() and dist.is_initialized():
             dist.barrier()

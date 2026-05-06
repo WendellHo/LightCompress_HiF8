@@ -8,7 +8,6 @@ from llmc.utils.registry_factory import MODEL_REGISTRY
 from .base_model import BaseModel
 
 
-# Only verified that vit-base-patch16-224 is correct.
 @MODEL_REGISTRY
 class Vit(BaseModel):
     def __init__(self, config, device_map=None, use_cache=False):
@@ -32,13 +31,13 @@ class Vit(BaseModel):
         return [self.embed_tokens]
 
     def get_head_layers(self):
-        return ['classifier']
+        return [self.model.classifier]
 
     def get_pre_head_layernorm_layers(self):
-        return [self.model.layernorm]
+        return [self.model.vit.layernorm]
 
     def get_layers_except_blocks(self):
-        return [self.embed_tokens, self.model.layernorm, self.model.classifier]
+        return [self.embed_tokens, self.model.vit.layernorm, self.model.classifier]
 
     def skip_layer_name(self):
         return ['classifier']
@@ -47,6 +46,7 @@ class Vit(BaseModel):
         return False
 
     def get_layernorms_in_block(self, block, modality='vision'):
+        del modality
         return {
             'layernorm_before': block.layernorm_before,
             'layernorm_after': block.layernorm_after,
@@ -76,7 +76,7 @@ class Vit(BaseModel):
         img_data_list = []
         for img in imgs:
             path = img['image']
-            img_data = Image.open(path)
+            img_data = Image.open(path).convert('RGB')
             img_data_list.append(img_data)
         inputs = self.processor(images=img_data_list, return_tensors='pt')
         return inputs

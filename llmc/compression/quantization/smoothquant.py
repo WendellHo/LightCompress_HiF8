@@ -26,14 +26,27 @@ class SmoothQuant(BaseBlockwiseQuantization):
         special_config = self.quant_config.get('special', {})
         self.alpha = special_config.get('alpha', 0.5)
         hiband_cfg = special_config.get('hiband', {}) if isinstance(special_config, dict) else {}
-        self.hiband_enabled = bool(hiband_cfg.get('enabled', False))
+        hiband_enabled = bool(hiband_cfg.get('enabled', False))
+        image_model = self.config.model.type in ['Vit', 'ResNet']
+        self.hiband_act_scale_enabled = hiband_enabled and bool(
+            hiband_cfg.get('act_scale_enabled', True)
+        )
         self.hiband_k_min = int(hiband_cfg.get('k_min', -5))
         self.hiband_k_max = int(hiband_cfg.get('k_max', 5))
         self.hiband_use_offset = bool(hiband_cfg.get('use_offset', False))
         self.hiband_eps = float(hiband_cfg.get('eps', 1e-12))
         self.hiband_use_true_qdq_mse = bool(hiband_cfg.get('use_true_qdq_mse', False))
-        self.hiband_weight_scale_enabled = bool(
-            hiband_cfg.get('weight_scale_enabled', True)
+        self.hiband_weight_scale_enabled = hiband_enabled and bool(
+            hiband_cfg.get('weight_scale_enabled', False if image_model else True)
+        )
+        if self.hiband_weight_scale_enabled and not self.hiband_act_scale_enabled:
+            logger.warning(
+                'HiBand weight-side search requires act-side HiBand. '
+                'Disable weight-side HiBand for current config.'
+            )
+            self.hiband_weight_scale_enabled = False
+        self.hiband_enabled = (
+            self.hiband_act_scale_enabled or self.hiband_weight_scale_enabled
         )
         sample_ratio = hiband_cfg.get('sample_ratio', None)
         if sample_ratio is None:
@@ -546,14 +559,26 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return hiband_scale.to(device=target_device, dtype=target_dtype)
 
     @torch.no_grad()
-    def _collect_hiband_histogram(self, tensors, scale):
+    def _prepare_hiband_post_scale_rows(self, tensor, scale, channel_axis=-1):
+        rows = self._flatten_by_channel(tensor, channel_axis)
+        if rows.shape[-1] != scale.numel():
+            raise RuntimeError(
+                f'HiBand channel mismatch: rows.shape[-1]={rows.shape[-1]} '
+                f'vs scale.numel()={scale.numel()}'
+            )
+        scale_view = scale.to(device=rows.device, dtype=rows.dtype).view(1, -1)
+        return (rows / scale_view).detach().to(torch.float32)
+
+    @torch.no_grad()
+    def _collect_hiband_histogram(self, tensors, scale, channel_axis=-1):
         num_steps = self._resolve_hiband_num_steps(len(tensors))
         step_buckets = self._split_by_timestep(tensors, num_steps)
         num_channels = None
         for bucket in step_buckets:
             for tensor in bucket:
-                if tensor.shape[-1] > 0:
-                    num_channels = tensor.shape[-1]
+                rows = self._flatten_by_channel(tensor, channel_axis)
+                if rows.shape[-1] > 0:
+                    num_channels = rows.shape[-1]
                     break
             if num_channels is not None:
                 break
@@ -565,11 +590,12 @@ class SmoothQuant(BaseBlockwiseQuantization):
             if len(bucket) == 0:
                 continue
             for tensor in bucket:
-                if tensor.shape[-1] == 0:
+                rows = self._flatten_by_channel(tensor, channel_axis)
+                if rows.shape[-1] == 0:
                     continue
-                shape = [1] * (tensor.dim() - 1) + [-1]
-                post = tensor / scale.to(device=tensor.device, dtype=tensor.dtype).view(*shape)
-                post = post.view(-1, post.shape[-1]).detach().to(torch.float32).cpu()
+                post = self._prepare_hiband_post_scale_rows(
+                    tensor, scale, channel_axis=channel_axis
+                ).cpu()
                 chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
                 for start in range(0, post.shape[0], chunk_size):
                     chunk = post[start:start + chunk_size]
@@ -582,7 +608,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return result
 
     @torch.no_grad()
-    def _collect_hiband_histogram_stream(self, stream_stats, input_name, scale):
+    def _collect_hiband_histogram_stream(self, stream_stats, input_name, scale, channel_axis=-1):
         if self._current_block is None:
             raise ValueError('SmoothQuant stream_stats HiBand requires current block context.')
 
@@ -599,9 +625,9 @@ class SmoothQuant(BaseBlockwiseQuantization):
             inp = x[0].detach()
             if len(inp.shape) == 2:
                 inp = inp.unsqueeze(0)
-            shape = [1] * (inp.dim() - 1) + [-1]
-            post = inp / scale_cpu.to(device=inp.device, dtype=inp.dtype).view(*shape)
-            post = post.view(-1, post.shape[-1]).to(torch.float32).cpu()
+            post = self._prepare_hiband_post_scale_rows(
+                inp, scale_cpu, channel_axis=channel_axis
+            ).cpu()
 
             if hist_state[0] is None:
                 hist_state[0] = self._init_hiband_histogram_state(
@@ -628,15 +654,16 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return result
 
     @torch.no_grad()
-    def _collect_hiband_act_samples(self, tensors, scale):
+    def _collect_hiband_act_samples(self, tensors, scale, channel_axis=-1):
         samples = []
         num_steps = self._resolve_hiband_num_steps(len(tensors))
         step_buckets = self._split_by_timestep(tensors, num_steps)
         total_rows = 0
         for bucket in step_buckets:
             for tensor in bucket:
-                if tensor.shape[-1] > 0:
-                    total_rows += int(tensor.numel() // tensor.shape[-1])
+                rows = self._flatten_by_channel(tensor, channel_axis)
+                if rows.shape[-1] > 0:
+                    total_rows += int(rows.shape[0])
         target_budget = self._resolve_hiband_token_budget(total_rows)
         step_budgets = self._build_uniform_budgets(len(step_buckets), target_budget)
         for bucket, step_budget in zip(step_buckets, step_budgets):
@@ -646,9 +673,9 @@ class SmoothQuant(BaseBlockwiseQuantization):
             for tensor, tensor_budget in zip(bucket, tensor_budgets):
                 if tensor_budget <= 0:
                     continue
-                shape = [1] * (tensor.dim() - 1) + [-1]
-                post = tensor / scale.to(device=tensor.device, dtype=tensor.dtype).view(*shape)
-                post = post.view(-1, post.shape[-1]).detach().to(torch.float32)
+                post = self._prepare_hiband_post_scale_rows(
+                    tensor, scale, channel_axis=channel_axis
+                )
                 post = self._sample_rows_evenly(post, min(post.shape[0], tensor_budget))
                 if post.numel() > 0:
                     samples.append(post)
@@ -657,7 +684,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return torch.cat(samples, dim=0)
 
     @torch.no_grad()
-    def _collect_hiband_act_samples_stream(self, stream_stats, input_name, scale):
+    def _collect_hiband_act_samples_stream(self, stream_stats, input_name, scale, channel_axis=-1):
         if self._current_block is None:
             raise ValueError('SmoothQuant stream_stats HiBand requires current block context.')
 
@@ -708,9 +735,9 @@ class SmoothQuant(BaseBlockwiseQuantization):
             inp = x[0].detach()
             if len(inp.shape) == 2:
                 inp = inp.unsqueeze(0)
-            shape = [1] * (inp.dim() - 1) + [-1]
-            post = inp / scale_cpu.to(device=inp.device, dtype=inp.dtype).view(*shape)
-            post = post.view(-1, post.shape[-1]).to(torch.float32).cpu()
+            post = self._prepare_hiband_post_scale_rows(
+                inp, scale_cpu, channel_axis=channel_axis
+            ).cpu()
             post = self._sample_rows_evenly(post, min(post.shape[0], occurrence_budget))
             if post.numel() > 0:
                 samples.append(post)
@@ -762,7 +789,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
     @torch.no_grad()
     def _attach_hiband_act_scale(self, layers, hiband_act_scale):
         for layer in layers:
-            if not hasattr(layer, 'weight') or layer.weight.shape[-1] != hiband_act_scale.numel():
+            if not self._hiband_scale_matches_layer(layer, hiband_act_scale):
                 continue
             value = hiband_act_scale.to(device=layer.weight.device, dtype=torch.float32)
             if hasattr(layer, 'hiband_act_scale'):
@@ -784,16 +811,16 @@ class SmoothQuant(BaseBlockwiseQuantization):
             not hasattr(layer, 'weight')
             or act_alpha is None
             or act_beta is None
-            or layer.weight.shape[-1] != act_alpha.numel()
+            or not self._hiband_scale_matches_layer(layer, act_alpha)
             or act_alpha.numel() != act_beta.numel()
         ):
             return None
 
-        post_weight = layer.weight.detach().to(torch.float32) * base_scale.to(
-            device=layer.weight.device, dtype=torch.float32
-        ).view(1, -1)
+        post_weight = self._get_hiband_post_weight(layer, base_scale)
+        if post_weight is None:
+            return None
         if self.hiband_use_offset:
-            channel_max = post_weight.abs().amax(dim=0)
+            channel_max = self._get_hiband_weight_channel_max(layer, post_weight)
             nonzero_channel = channel_max > self.hiband_eps
             offset = torch.where(
                 nonzero_channel,
@@ -822,10 +849,12 @@ class SmoothQuant(BaseBlockwiseQuantization):
         act_beta = act_beta.to(device=post_weight.device, dtype=torch.float32)
         for idx in range(candidate_count):
             k = candidate[idx].to(torch.float32)
-            cand_scale = torch.pow(2.0, k).clamp(min=self.hiband_eps).view(1, -1)
-            w_hb = self._hif8_qdq_like(post_weight / cand_scale) * cand_scale
-            cand_norm = w_hb.pow(2).sum(dim=0)
-            cand_dot = (w_hb * post_weight).sum(dim=0)
+            cand_scale = torch.pow(2.0, k).clamp(min=self.hiband_eps)
+            cand_scale_view = self._view_hiband_weight_scale(layer, cand_scale)
+            w_hb = self._hif8_qdq_like(post_weight / cand_scale_view) * cand_scale_view
+            cand_norm, cand_dot = self._get_hiband_weight_score_terms(
+                layer, w_hb, post_weight
+            )
             score = act_alpha * cand_norm - 2.0 * act_beta * cand_dot
             if best_score is None:
                 best_score = score
@@ -869,9 +898,9 @@ class SmoothQuant(BaseBlockwiseQuantization):
 
     @torch.no_grad()
     def _apply_hiband_weight_scale(self, layer, hiband_weight_scale):
-        if not hasattr(layer, 'weight') or layer.weight.shape[-1] != hiband_weight_scale.numel():
+        if not self._hiband_scale_matches_layer(layer, hiband_weight_scale):
             return
-        scale = hiband_weight_scale.to(device=layer.weight.device, dtype=torch.float32).view(1, -1)
+        scale = self._view_hiband_weight_scale(layer, hiband_weight_scale)
         weight = layer.weight.detach().to(torch.float32)
         qdq_weight = self._hif8_qdq_like(weight / scale) * scale
         layer.weight.data.copy_(qdq_weight.to(dtype=layer.weight.dtype))
@@ -888,11 +917,36 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return bool(subset.get('is_attn_o', False))
 
     @torch.no_grad()
+    def _get_channel_axis(self, layer):
+        if hasattr(layer, 'weight') and layer.weight.dim() == 4:
+            return 1
+        return -1
+
+    @torch.no_grad()
+    def _flatten_by_channel(self, x, channel_axis):
+        if channel_axis < 0:
+            channel_axis = x.dim() + channel_axis
+        if channel_axis < 0 or channel_axis >= x.dim():
+            raise ValueError(f'Invalid channel axis: {channel_axis}')
+        if channel_axis != x.dim() - 1:
+            permute_dims = [idx for idx in range(x.dim()) if idx != channel_axis] + [channel_axis]
+            x = x.permute(*permute_dims).contiguous()
+        return x.view(-1, x.shape[-1])
+
+    @torch.no_grad()
     def get_weight_scale(self, layers):
         weights = self.collect_layers_weights(layers)
-        scale = torch.cat(
-            [fc.abs().max(dim=0, keepdim=True)[0] for fc in weights], dim=0
-        )
+        scale_values = []
+        for fc in weights:
+            if fc.dim() == 2:
+                scale_values.append(fc.abs().max(dim=0, keepdim=True)[0])
+            elif fc.dim() == 4:
+                scale_values.append(
+                    fc.abs().amax(dim=(0, 2, 3), keepdim=False).unsqueeze(0)
+                )
+            else:
+                raise NotImplementedError(f'Unsupported weight dim: {fc.dim()}')
+        scale = torch.cat(scale_values, dim=0)
         scale = scale.max(dim=0)[0].clamp(min=1e-5)
         del weights
         gc.collect()
@@ -900,11 +954,11 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return scale
 
     @torch.no_grad()
-    def get_act_scale(self, tensors):
+    def get_act_scale(self, tensors, channel_axis=-1):
         scale_max = None
         for x in tensors:
             x = x.cuda()
-            comming_max = self._channel_abs_max(x)
+            comming_max = self._channel_abs_max(x, channel_axis)
             if scale_max is not None:
                 scale_max = torch.max(scale_max, comming_max)
             else:
@@ -913,8 +967,8 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return scale_max
 
     @torch.no_grad()
-    def _channel_abs_max(self, x):
-        x = x.view(-1, x.shape[-1])
+    def _channel_abs_max(self, x, channel_axis=-1):
+        x = self._flatten_by_channel(x, channel_axis)
         if not self.stream_stats or self.stream_chunk_size <= 0 or x.shape[0] <= self.stream_chunk_size:
             return x.abs().max(dim=0)[0]
 
@@ -938,7 +992,8 @@ class SmoothQuant(BaseBlockwiseQuantization):
         if self.stream_stats and isinstance(tensors, dict):
             x_max = self._get_stream_act_scale(tensors)
         else:
-            x_max = self.get_act_scale(tensors)
+            channel_axis = self._get_channel_axis(layers[0])
+            x_max = self.get_act_scale(tensors, channel_axis=channel_axis)
         x_max = x_max.to(dtype=w_max.dtype, device=w_max.device)
         scale = (x_max.pow(self.alpha) / w_max.pow(1 - self.alpha)).clamp(min=1e-5)
         return scale
@@ -955,7 +1010,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
         inp = inputs[0]
         if len(inp.shape) == 2:
             inp = inp.unsqueeze(0)
-        flat = inp.abs().view(-1, inp.shape[-1])
+        flat = self._flatten_by_channel(inp.abs(), self._get_channel_axis(m))
         token_row_count = flat.shape[0]
         inp = flat.amax(dim=0).to(torch.float32).cpu()
 
@@ -1004,32 +1059,38 @@ class SmoothQuant(BaseBlockwiseQuantization):
             )
         else:
             scale = self.search_scale_subset(layers, input_feat[input_name])
+        channel_axis = self._get_channel_axis(layers[0])
         hiband_act_scale = None
         hiband_weight_scales = {}
         if self.hiband_enabled:
             needs_act_samples = (
-                self.hiband_use_true_qdq_mse
-                or (not is_attn_o and self.hiband_weight_scale_enabled)
+                self.hiband_act_scale_enabled
+                and (
+                    self.hiband_use_true_qdq_mse
+                    or (not is_attn_o and self.hiband_weight_scale_enabled)
+                )
             )
             if needs_act_samples:
                 if self.stream_stats and isinstance(input_feat[input_name], dict):
                     act_samples = self._collect_hiband_act_samples_stream(
-                        input_feat[input_name], input_name, scale
+                        input_feat[input_name], input_name, scale, channel_axis=channel_axis
                     )
                 else:
-                    act_samples = self._collect_hiband_act_samples(input_feat[input_name], scale)
+                    act_samples = self._collect_hiband_act_samples(
+                        input_feat[input_name], scale, channel_axis=channel_axis
+                    )
                 hiband_act_scale = self._search_hiband_scale(
                     act_samples, scale.device, scale.dtype, side='act'
                 )
-            else:
+            elif self.hiband_act_scale_enabled:
                 act_samples = None
                 if self.stream_stats and isinstance(input_feat[input_name], dict):
                     hist_result = self._collect_hiband_histogram_stream(
-                        input_feat[input_name], input_name, scale
+                        input_feat[input_name], input_name, scale, channel_axis=channel_axis
                     )
                 else:
                     hist_result = self._collect_hiband_histogram(
-                        input_feat[input_name], scale
+                        input_feat[input_name], scale, channel_axis=channel_axis
                     )
                 if hist_result is not None:
                     offset, hist, overflow_tail_hist, zero_count, min_exp, N_c = hist_result
@@ -1037,6 +1098,8 @@ class SmoothQuant(BaseBlockwiseQuantization):
                         offset, hist, overflow_tail_hist, zero_count, min_exp, N_c,
                         scale.device, scale.dtype, side='act',
                     )
+            else:
+                act_samples = None
             if (
                 not is_attn_o
                 and self.hiband_weight_scale_enabled
@@ -1050,7 +1113,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
                     scale.device,
                     scale.dtype,
                 )
-            if hiband_act_scale is not None:
+            if self.hiband_act_scale_enabled and hiband_act_scale is not None:
                 self._attach_hiband_act_scale(layers, hiband_act_scale)
         if not is_attn_o:
             self.apply_scale(scale, prev_op, layers)
@@ -1058,6 +1121,6 @@ class SmoothQuant(BaseBlockwiseQuantization):
                 self._apply_hiband_weight_scale(layer, layer_scale)
             if self.act_static:
                 self.update_input_feat(scale, input_feat, layers_dict, False)
-        if self.hiband_enabled and hiband_act_scale is not None:
+        if self.hiband_act_scale_enabled and hiband_act_scale is not None:
             key = ','.join(sorted(layers_dict.keys()))
             self.hiband_act_scales[key] = hiband_act_scale.detach().cpu()
