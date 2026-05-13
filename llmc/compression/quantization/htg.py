@@ -588,7 +588,7 @@ class HTG(BaseBlockwiseQuantization):
                 post = tensor - shift.view(*shape)
                 post = post / scale.to(device=tensor.device, dtype=tensor.dtype).view(*shape)
                 post = post.view(-1, post.shape[-1]).detach().to(torch.float32).cpu()
-                chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
+                chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 32768
                 for start in range(0, post.shape[0], chunk_size):
                     chunk = post[start:start + chunk_size]
                     self._incremental_update_hiband_histogram(state, chunk)
@@ -652,7 +652,7 @@ class HTG(BaseBlockwiseQuantization):
                 post = tensor - shift.view(*shape)
                 post = post / scale.to(device=tensor.device, dtype=tensor.dtype).view(*shape)
                 post = post.view(-1, post.shape[-1]).detach().to(torch.float32).cpu()
-                chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
+                chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 32768
                 for start in range(0, post.shape[0], chunk_size):
                     chunk = post[start:start + chunk_size]
                     self._incremental_update_hiband_histogram(states[group_idx], chunk)
@@ -1090,7 +1090,7 @@ class HTG(BaseBlockwiseQuantization):
         scale_cpu = scale.detach().to(torch.float32).cpu()
         global_hist_state = [None] if collect_global else None
         group_hist_states = [None for _ in range(group_num)] if collect_grouped else None
-        chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 8192
+        chunk_size = self.hiband_sample_max_tokens if self.hiband_sample_max_tokens > 0 else 32768
 
         def collect_hiband_histogram_hook(_, x, _output):
             step_idx = stream_state['idx'] % num_steps

@@ -100,6 +100,7 @@ class Vit(BaseModel):
                 'input': ['attention.output.dense'],
                 'inspect': block.attention.output.dense,
                 'has_kwargs': False,
+                'hiband_act_only': True,
             },
             {
                 'layers': {'intermediate.dense': block.intermediate.dense},

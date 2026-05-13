@@ -758,11 +758,11 @@ class SmoothQuant(BaseBlockwiseQuantization):
         if not hasattr(layer, 'weight'):
             return None
         weight = layer.weight.detach()
-        if weight.shape[-1] != scale.numel():
+        if not self._hiband_scale_matches_layer(layer, scale):
             return None
-        merged = weight.to(torch.float32) * scale.to(
-            device=weight.device, dtype=torch.float32
-        ).view(1, -1)
+        merged = weight.to(torch.float32) * self._view_hiband_weight_scale(
+            layer, scale, dtype=torch.float32
+        )
         merged = merged.view(-1, merged.shape[-1])
         budget = self._resolve_hiband_token_budget(int(merged.shape[0]))
         return self._sample_rows_evenly(merged, min(merged.shape[0], budget))
@@ -917,6 +917,10 @@ class SmoothQuant(BaseBlockwiseQuantization):
         return bool(subset.get('is_attn_o', False))
 
     @torch.no_grad()
+    def _is_hiband_act_only_subset(self, subset):
+        return bool(subset.get('hiband_act_only', False))
+
+    @torch.no_grad()
     def _get_channel_axis(self, layer):
         if hasattr(layer, 'weight') and layer.weight.dim() == 4:
             return 1
@@ -1046,14 +1050,21 @@ class SmoothQuant(BaseBlockwiseQuantization):
         prev_op = subset['prev_op']
         input_name = subset['input'][0]
         is_attn_o = self._is_attn_o_subset(subset)
+        hiband_act_only = self._is_hiband_act_only_subset(subset)
+        skip_scale_transform = is_attn_o or hiband_act_only
 
-        if not is_attn_o and not self.filter_subset(prev_op):
+        if not skip_scale_transform and not self.filter_subset(prev_op):
             logger.info('Do not transform this subset.')
             return
         layers = list(layers_dict.values())
-        if is_attn_o:
+        if skip_scale_transform:
+            input_channels = self._get_hiband_input_channels(layers[0])
+            if input_channels is None:
+                raise RuntimeError(
+                    f'Can not infer HiBand input channels for layer: {type(layers[0])}'
+                )
             scale = torch.ones(
-                layers[0].weight.shape[-1],
+                input_channels,
                 device=layers[0].weight.device,
                 dtype=layers[0].weight.dtype,
             )
@@ -1067,7 +1078,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
                 self.hiband_act_scale_enabled
                 and (
                     self.hiband_use_true_qdq_mse
-                    or (not is_attn_o and self.hiband_weight_scale_enabled)
+                    or (not skip_scale_transform and self.hiband_weight_scale_enabled)
                 )
             )
             if needs_act_samples:
@@ -1101,7 +1112,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
             else:
                 act_samples = None
             if (
-                not is_attn_o
+                not skip_scale_transform
                 and self.hiband_weight_scale_enabled
                 and hiband_act_scale is not None
             ):
@@ -1115,7 +1126,7 @@ class SmoothQuant(BaseBlockwiseQuantization):
                 )
             if self.hiband_act_scale_enabled and hiband_act_scale is not None:
                 self._attach_hiband_act_scale(layers, hiband_act_scale)
-        if not is_attn_o:
+        if not skip_scale_transform:
             self.apply_scale(scale, prev_op, layers)
             for layer, layer_scale in hiband_weight_scales.items():
                 self._apply_hiband_weight_scale(layer, layer_scale)

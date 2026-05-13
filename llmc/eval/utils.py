@@ -1,6 +1,7 @@
 import copy
 import os
 from datetime import datetime
+from time import perf_counter
 
 import torch.distributed as dist
 from loguru import logger
@@ -11,7 +12,9 @@ from llmc.eval import (AccuracyEval, CustomGenerate, CustomGenerateJustInfer,
 from llmc.utils import deploy_all_modality
 
 
-def _save_eval_result(config_for_eval, eval_pos, eval_name, dataset_name, res):
+def _save_eval_result(
+    config_for_eval, eval_pos, eval_name, dataset_name, res, elapsed_seconds=None
+):
     if 'save' not in config_for_eval or 'save_path' not in config_for_eval.save:
         return
 
@@ -23,9 +26,15 @@ def _save_eval_result(config_for_eval, eval_pos, eval_name, dataset_name, res):
     result_path = os.path.join(save_dir, 'eval_results.txt')
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     with open(result_path, 'a', encoding='utf-8') as f:
+        duration_info = (
+            f' duration_s={elapsed_seconds:.3f}'
+            if elapsed_seconds is not None
+            else ''
+        )
         f.write(
             f'[{timestamp}] eval_pos={eval_pos} '
-            f'eval={eval_name} dataset={dataset_name} result={res}\n'
+            f'eval={eval_name} dataset={dataset_name} result={res}'
+            f'{duration_info}\n'
         )
 
 
@@ -127,13 +136,27 @@ def eval_model(model, blockwise_opts, eval_list, eval_pos):
                 continue
             if is_distributed_video_gen:
                 has_distributed_video_eval = True
+            eval_name = config_for_eval.eval.type
+            start_ts = perf_counter() if eval_name == 'acc' else None
             res = eval_class.eval(model, eval_pos)
+            elapsed_seconds = (
+                perf_counter() - start_ts if start_ts is not None else None
+            )
             if rank == 0:
-                eval_name = config_for_eval.eval.type
                 dataset_name = config_for_eval.eval.name
                 logger.info(f'EVAL: {eval_name} on {dataset_name} is {res}')
+                if elapsed_seconds is not None:
+                    logger.info(
+                        f'EVAL ACC TIME: {dataset_name} at {eval_pos} '
+                        f'cost {elapsed_seconds:.3f}s'
+                    )
                 _save_eval_result(
-                    config_for_eval, eval_pos, eval_name, dataset_name, res
+                    config_for_eval,
+                    eval_pos,
+                    eval_name,
+                    dataset_name,
+                    res,
+                    elapsed_seconds=elapsed_seconds,
                 )
 
         if has_distributed_video_eval and dist.is_available() and dist.is_initialized():

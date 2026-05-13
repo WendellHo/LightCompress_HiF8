@@ -3,6 +3,7 @@ from .awq import Awq
 from .base_blockwise_quantization import BaseBlockwiseQuantization
 from .dgq import DGQ
 from .gptq import GPTQ
+from .hiband import HiBand
 from .hqq import HQQ
 from .htg import HTG
 from .kvquant import KiviQuantKVCache, NaiveQuantKVCache
